@@ -2,17 +2,17 @@ import AppKit
 import Foundation
 import SwiftUI
 
-public final class OverlayWindowController: NSWindowController {
+public final class OverlayWindowController: NSWindowController, ObservableObject {
     public var onChange: ((CaptureBox) -> Void)?
     public var aspectLock = true
-    public var outputResolution = OutputResolution(width: 1, height: 1)
+    @Published public var outputResolution = OutputResolution(width: 1, height: 1)
 
     public var captureWindowID: CGWindowID? {
         guard let number = window?.windowNumber, number > 0 else { return nil }
         return CGWindowID(number)
     }
 
-    private(set) var captureBox: CaptureBox
+    @Published public private(set) var captureBox: CaptureBox
     private var dragOriginFrame: NSRect?
     private var dragOriginMouse: NSPoint?
     private var monitor: Any?
@@ -47,9 +47,7 @@ public final class OverlayWindowController: NSWindowController {
         window.sharingType = .none
         window.isReleasedWhenClosed = false
         super.init(window: window)
-        let view = OverlayHUD(
-            controller: self
-        )
+        let view = OverlayHUD(controller: self)
         window.contentView = NSHostingView(rootView: view)
     }
 
@@ -282,7 +280,7 @@ public enum OverlayHandle: CaseIterable {
 }
 
 private struct OverlayHUD: View {
-    unowned let controller: OverlayWindowController
+    @ObservedObject var controller: OverlayWindowController
     private let border: CGFloat = 4
     private let dragRingThickness: CGFloat = 14
     private let handle: CGFloat = 14

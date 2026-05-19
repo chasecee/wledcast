@@ -47,6 +47,7 @@ public final class DisplayFrameSource {
     private var rgbScratch: [UInt8]
     private var deliveredFrames = 0
     private var lastDiagnosticsAt = Date.distantPast
+    private let maxCaptureDimension = 4096
 
     public init(
         boxRef: CaptureBoxRef,
@@ -80,6 +81,9 @@ public final class DisplayFrameSource {
         guard box.displayID == activeDisplayID else { return }
         guard let stream, let configuration = streamConfiguration else { return }
         configuration.sourceRect = sourceRect(for: box)
+        let captureSize = captureSize(for: .region, displayID: activeDisplayID, box: box, windowSizePoints: nil)
+        configuration.width = captureSize.width
+        configuration.height = captureSize.height
         Task {
             try? await stream.updateConfiguration(configuration)
         }
@@ -96,11 +100,17 @@ public final class DisplayFrameSource {
 
     private func startStream() async throws {
         let content = try await SCShareableContent.current
-        let (filter, displayID) = try buildFilter(content: content)
+        let (filter, displayID, windowSizePoints) = try buildFilter(content: content)
+        let captureSize = captureSize(
+            for: captureSelection.mode,
+            displayID: displayID,
+            box: boxRef.box,
+            windowSizePoints: windowSizePoints
+        )
 
         let configuration = SCStreamConfiguration()
-        configuration.width = max(1, outputResolution.width)
-        configuration.height = max(1, outputResolution.height)
+        configuration.width = captureSize.width
+        configuration.height = captureSize.height
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.scalesToFit = false
@@ -112,7 +122,7 @@ public final class DisplayFrameSource {
 
         activeDisplayID = displayID
         Log.capture.notice(
-            "stream display=\(displayID) src=\(configuration.sourceRect) out=\(configuration.width)x\(configuration.height) fps=\(fps)"
+            "stream display=\(displayID) src=\(configuration.sourceRect) out=\(configuration.width)x\(configuration.height) target=\(outputResolution.width)x\(outputResolution.height) fps=\(fps)"
         )
 
         let newStream = SCStream(filter: filter, configuration: configuration, delegate: nil)
@@ -122,7 +132,7 @@ public final class DisplayFrameSource {
         streamConfiguration = configuration
     }
 
-    private func buildFilter(content: SCShareableContent) throws -> (SCContentFilter, CGDirectDisplayID) {
+    private func buildFilter(content: SCShareableContent) throws -> (SCContentFilter, CGDirectDisplayID, CGSize?) {
         switch captureSelection.mode {
         case .window:
             guard
@@ -132,7 +142,7 @@ public final class DisplayFrameSource {
                 throw NSError(domain: "DisplayFrameSource", code: 2)
             }
             let fallbackDisplayID = content.displays.first?.displayID ?? CGMainDisplayID()
-            return (SCContentFilter(desktopIndependentWindow: window), fallbackDisplayID)
+            return (SCContentFilter(desktopIndependentWindow: window), fallbackDisplayID, window.frame.size)
         case .display, .region:
             let display: SCDisplay?
             if let displayID = captureSelection.displayID {
@@ -145,8 +155,60 @@ public final class DisplayFrameSource {
                 throw NSError(domain: "DisplayFrameSource", code: 3)
             }
             let excluded = content.windows.filter { excludedWindowIDs.contains($0.windowID) }
-            return (SCContentFilter(display: display, excludingWindows: excluded), display.displayID)
+            return (SCContentFilter(display: display, excludingWindows: excluded), display.displayID, nil)
         }
+    }
+
+    private func captureSize(
+        for mode: CaptureMode,
+        displayID: CGDirectDisplayID,
+        box: CaptureBox,
+        windowSizePoints: CGSize?
+    ) -> (width: Int, height: Int) {
+        switch mode {
+        case .region:
+            let scale = backingScale(for: displayID)
+            return clampCaptureSize(
+                width: Int((CGFloat(max(1, box.width)) * scale).rounded()),
+                height: Int((CGFloat(max(1, box.height)) * scale).rounded())
+            )
+        case .display:
+            if let screen = NSScreen.screen(for: displayID) {
+                let scale = screen.backingScaleFactor
+                return clampCaptureSize(
+                    width: Int((screen.frame.width * scale).rounded()),
+                    height: Int((screen.frame.height * scale).rounded())
+                )
+            }
+            return clampCaptureSize(width: outputResolution.width, height: outputResolution.height)
+        case .window:
+            if let windowSizePoints {
+                let scale = backingScale(for: displayID)
+                return clampCaptureSize(
+                    width: Int((max(1, windowSizePoints.width) * scale).rounded()),
+                    height: Int((max(1, windowSizePoints.height) * scale).rounded())
+                )
+            }
+            if let screen = NSScreen.screen(for: displayID) {
+                let scale = screen.backingScaleFactor
+                return clampCaptureSize(
+                    width: Int((screen.frame.width * scale).rounded()),
+                    height: Int((screen.frame.height * scale).rounded())
+                )
+            }
+            return clampCaptureSize(width: outputResolution.width, height: outputResolution.height)
+        }
+    }
+
+    private func backingScale(for displayID: CGDirectDisplayID) -> CGFloat {
+        NSScreen.screen(for: displayID)?.backingScaleFactor ?? 2.0
+    }
+
+    private func clampCaptureSize(width: Int, height: Int) -> (width: Int, height: Int) {
+        (
+            width: min(maxCaptureDimension, max(1, width)),
+            height: min(maxCaptureDimension, max(1, height))
+        )
     }
 
     private func consume(sampleBuffer: CMSampleBuffer) {

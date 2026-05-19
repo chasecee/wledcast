@@ -10,6 +10,7 @@ struct SettingsView: View {
     @State private var balanceR: Double = Double(FilterConfig.default.balanceR)
     @State private var balanceG: Double = Double(FilterConfig.default.balanceG)
     @State private var balanceB: Double = Double(FilterConfig.default.balanceB)
+    @State private var flickerFighter: Double = 0
 
     var body: some View {
         ScrollView {
@@ -93,6 +94,7 @@ struct SettingsView: View {
                         slider("Balance R", value: $balanceR, range: 0...2)
                         slider("Balance G", value: $balanceG, range: 0...2)
                         slider("Balance B", value: $balanceB, range: 0...2)
+                        slider("Flicker", value: $flickerFighter, range: 0...1)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -109,6 +111,7 @@ struct SettingsView: View {
             balanceR = Double(model.filters.balanceR)
             balanceG = Double(model.filters.balanceG)
             balanceB = Double(model.filters.balanceB)
+            flickerFighter = model.flickerFighter
         }
         .onChange(of: saturation) { _, _ in applyFilters() }
         .onChange(of: brightness) { _, _ in applyFilters() }
@@ -117,6 +120,7 @@ struct SettingsView: View {
         .onChange(of: balanceR) { _, _ in applyFilters() }
         .onChange(of: balanceG) { _, _ in applyFilters() }
         .onChange(of: balanceB) { _, _ in applyFilters() }
+        .onChange(of: flickerFighter) { _, value in model.setFlickerFighter(value) }
     }
 
     private func slider(_ title: String, value: Binding<Double>, range: ClosedRange<Double>) -> some View {

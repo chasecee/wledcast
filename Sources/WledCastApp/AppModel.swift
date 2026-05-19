@@ -11,6 +11,7 @@ final class AppModel: ObservableObject {
     @Published var selectedHost: String = ""
     @Published var outputResolution: OutputResolution?
     @Published var filters: FilterConfig = .default
+    @Published var flickerFighter: Double = 0
     @Published var captureBox: CaptureBox = .centered(on: NSScreen.main ?? NSScreen.screens.first!)
     @Published var captureMode: CaptureMode = .region
     @Published var fps: Int = 30
@@ -123,6 +124,12 @@ final class AppModel: ObservableObject {
         persist()
     }
 
+    func setFlickerFighter(_ value: Double) {
+        flickerFighter = min(1, max(0, value))
+        session?.updateFlickerFighter(Float(flickerFighter))
+        persist()
+    }
+
     private func ensureOverlayVisible() {
         if overlay == nil {
             toggleOverlay()
@@ -214,7 +221,8 @@ final class AppModel: ObservableObject {
             let controller = SessionController(
                 sender: newSender,
                 outputResolution: resolution,
-                filterConfig: filters
+                filterConfig: filters,
+                flickerFighter: Float(flickerFighter)
             )
             controller.onFrameProcessed = { [weak self] frame in
                 Task { @MainActor in
@@ -319,6 +327,7 @@ final class AppModel: ObservableObject {
         if let filterData = try? JSONEncoder().encode(filters) {
             defaults.set(filterData, forKey: "filters")
         }
+        defaults.set(flickerFighter, forKey: "flickerFighter")
         if let boxData = try? JSONEncoder().encode(captureBox) {
             defaults.set(boxData, forKey: "captureBox")
         }
@@ -346,6 +355,7 @@ final class AppModel: ObservableObject {
         {
             filters = decodedFilters
         }
+        flickerFighter = min(1, max(0, defaults.double(forKey: "flickerFighter")))
         if
             let boxData = defaults.data(forKey: "captureBox"),
             let decodedBox = try? JSONDecoder().decode(CaptureBox.self, from: boxData)

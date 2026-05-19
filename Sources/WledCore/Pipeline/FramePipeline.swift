@@ -2,6 +2,11 @@ import Foundation
 import Accelerate
 
 public enum FramePipeline {
+    private struct AxisTap {
+        let sourceIndex: Int
+        let weight: Float
+    }
+
     public static func process(
         frame: RGBFrame,
         output: OutputResolution,
@@ -21,18 +26,64 @@ public enum FramePipeline {
             return frame
         }
         var targetPixels = [UInt8](repeating: 0, count: targetWidth * targetHeight * 3)
+        let sourceWidth = frame.width
+        let sourceHeight = frame.height
+        let xScale = Float(sourceWidth) / Float(targetWidth)
+        let yScale = Float(sourceHeight) / Float(targetHeight)
+        let xTaps = axisTaps(sourceSize: sourceWidth, targetSize: targetWidth, scale: xScale)
+        let yTaps = axisTaps(sourceSize: sourceHeight, targetSize: targetHeight, scale: yScale)
+
         for y in 0..<targetHeight {
-            let sourceY = min(frame.height - 1, y * frame.height / targetHeight)
+            let rowTaps = yTaps[y]
             for x in 0..<targetWidth {
-                let sourceX = min(frame.width - 1, x * frame.width / targetWidth)
-                let sourceIndex = (sourceY * frame.width + sourceX) * 3
+                let columnTaps = xTaps[x]
+                var rSum: Float = 0
+                var gSum: Float = 0
+                var bSum: Float = 0
+                var weightSum: Float = 0
+
+                for yTap in rowTaps {
+                    let rowBase = yTap.sourceIndex * sourceWidth
+                    for xTap in columnTaps {
+                        let weight = xTap.weight * yTap.weight
+                        let sourceIndex = (rowBase + xTap.sourceIndex) * 3
+                        rSum += Float(frame.pixels[sourceIndex]) * weight
+                        gSum += Float(frame.pixels[sourceIndex + 1]) * weight
+                        bSum += Float(frame.pixels[sourceIndex + 2]) * weight
+                        weightSum += weight
+                    }
+                }
+
                 let targetIndex = (y * targetWidth + x) * 3
-                targetPixels[targetIndex] = frame.pixels[sourceIndex]
-                targetPixels[targetIndex + 1] = frame.pixels[sourceIndex + 1]
-                targetPixels[targetIndex + 2] = frame.pixels[sourceIndex + 2]
+                if weightSum > 0 {
+                    targetPixels[targetIndex] = clip(rSum / weightSum)
+                    targetPixels[targetIndex + 1] = clip(gSum / weightSum)
+                    targetPixels[targetIndex + 2] = clip(bSum / weightSum)
+                }
             }
         }
         return RGBFrame(width: targetWidth, height: targetHeight, pixels: targetPixels)
+    }
+
+    private static func axisTaps(sourceSize: Int, targetSize: Int, scale: Float) -> [[AxisTap]] {
+        var taps = [[AxisTap]]()
+        taps.reserveCapacity(targetSize)
+        for target in 0..<targetSize {
+            let start = Float(target) * scale
+            let end = Float(target + 1) * scale
+            let sourceStart = max(0, Int(start.rounded(.down)))
+            let sourceEnd = min(sourceSize, Int(end.rounded(.up)))
+            var pixelTaps = [AxisTap]()
+            pixelTaps.reserveCapacity(max(1, sourceEnd - sourceStart))
+            for source in sourceStart..<sourceEnd {
+                let weight = min(Float(source + 1), end) - max(Float(source), start)
+                if weight > 0 {
+                    pixelTaps.append(AxisTap(sourceIndex: source, weight: weight))
+                }
+            }
+            taps.append(pixelTaps)
+        }
+        return taps
     }
 
     private static func applyBrightness(frame: RGBFrame, brightness: Float) -> RGBFrame {
