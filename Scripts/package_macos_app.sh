@@ -53,6 +53,13 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <string>WledCast captures a region of your screen and streams it to WLED devices.</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>WledCast uses system events for window selection.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>WledCast discovers WLED matrices on your local network and streams pixels to them.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_wled._tcp</string>
+        <string>_http._tcp</string>
+    </array>
 </dict>
 </plist>
 PLIST

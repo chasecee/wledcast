@@ -38,6 +38,13 @@ Run from source:
 swift run wledcast-swift
 ```
 
+Live-reload dev loop (rebuild + relaunch on every Swift save):
+
+```shell
+brew install fswatch
+./Scripts/dev_watch.sh
+```
+
 Run CI checks locally:
 
 ```shell

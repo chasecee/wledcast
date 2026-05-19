@@ -1,0 +1,34 @@
+{
+  "matrix_2d": {
+    "input": {
+      "ver": "0.15.0",
+      "leds": {
+        "count": 256,
+        "matrix": {
+          "w": 16,
+          "h": 16
+        }
+      }
+    },
+    "expected": {
+      "width": 16,
+      "height": 16
+    }
+  },
+  "matrix_wide": {
+    "input": {
+      "ver": "0.14.4",
+      "leds": {
+        "count": 300,
+        "matrix": {
+          "w": 50,
+          "h": 6
+        }
+      }
+    },
+    "expected": {
+      "width": 50,
+      "height": 6
+    }
+  }
+}

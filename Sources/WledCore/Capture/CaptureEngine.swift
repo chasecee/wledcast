@@ -38,6 +38,7 @@ public final class DisplayFrameSource {
     private let outputResolution: OutputResolution
     private let fps: Int
     private let captureSelection: CaptureSelection
+    private let excludedWindowIDs: [CGWindowID]
     private let streamOutput = StreamOutput()
     private var stream: SCStream?
     private var streamConfiguration: SCStreamConfiguration?
@@ -51,12 +52,14 @@ public final class DisplayFrameSource {
         boxRef: CaptureBoxRef,
         outputResolution: OutputResolution,
         fps: Int,
-        captureSelection: CaptureSelection
+        captureSelection: CaptureSelection,
+        excludedWindowIDs: [CGWindowID] = []
     ) {
         self.boxRef = boxRef
         self.outputResolution = outputResolution
         self.fps = max(1, fps)
         self.captureSelection = captureSelection
+        self.excludedWindowIDs = excludedWindowIDs
         self.rgbScratch = [UInt8](repeating: 0, count: max(1, outputResolution.width * outputResolution.height * 3))
         streamOutput.onSampleBuffer = { [weak self] sampleBuffer in
             self?.consume(sampleBuffer: sampleBuffer)
@@ -141,7 +144,8 @@ public final class DisplayFrameSource {
             guard let display else {
                 throw NSError(domain: "DisplayFrameSource", code: 3)
             }
-            return (SCContentFilter(display: display, excludingWindows: []), display.displayID)
+            let excluded = content.windows.filter { excludedWindowIDs.contains($0.windowID) }
+            return (SCContentFilter(display: display, excludingWindows: excluded), display.displayID)
         }
     }
 

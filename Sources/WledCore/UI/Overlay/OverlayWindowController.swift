@@ -7,6 +7,11 @@ public final class OverlayWindowController: NSWindowController {
     public var aspectLock = true
     public var outputResolution = OutputResolution(width: 1, height: 1)
 
+    public var captureWindowID: CGWindowID? {
+        guard let number = window?.windowNumber, number > 0 else { return nil }
+        return CGWindowID(number)
+    }
+
     private(set) var captureBox: CaptureBox
     private var dragOriginFrame: NSRect?
     private var dragOriginMouse: NSPoint?

@@ -29,15 +29,15 @@ public actor WLEDDiscoveryClient {
         self.httpClient = httpClient
     }
 
-    public func fetchOutputResolution(host: String) async throws -> OutputResolution {
-        guard let url = stateURL(for: host) else {
+    public func fetchMatrixResolution(host: String) async throws -> OutputResolution {
+        guard let url = infoURL(for: host) else {
             throw NSError(domain: "WLEDDiscoveryClient", code: 400)
         }
         let (data, response) = try await httpClient.get(url: url)
         guard response.statusCode == 200 else {
             throw NSError(domain: "WLEDDiscoveryClient", code: response.statusCode)
         }
-        return try WLEDStateParser.outputResolution(from: data)
+        return try WLEDInfoParser.matrixResolution(from: data)
     }
 
     public func discoverHosts(timeout: TimeInterval = 3) async -> [String] {
@@ -75,13 +75,22 @@ public actor WLEDDiscoveryClient {
             return
         }
         let params = NWParameters.tcp
-        let newBrowser = NWBrowser(for: .bonjour(type: "_http._tcp", domain: "local"), using: params)
+        let newBrowser = NWBrowser(for: .bonjour(type: "_wled._tcp", domain: "local"), using: params)
         newBrowser.browseResultsChangedHandler = { [weak self] results, _ in
             Task { await self?.ingest(results: results) }
         }
-        newBrowser.stateUpdateHandler = { _ in }
+        newBrowser.stateUpdateHandler = { state in
+            Log.discovery.info("browser state \(String(describing: state))")
+        }
         newBrowser.start(queue: queue)
         browser = newBrowser
+    }
+
+    public func verify(host: String) async {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        hostCandidates.insert(trimmed)
+        await probeNewHosts([trimmed])
     }
 
     public func stop() {
@@ -110,6 +119,8 @@ public actor WLEDDiscoveryClient {
             }
         }
         guard !newHosts.isEmpty else { return }
+        let list = newHosts.sorted().joined(separator: ", ")
+        Log.discovery.info("bonjour candidates \(list)")
         await probeNewHosts(newHosts)
     }
 
@@ -117,14 +128,19 @@ public actor WLEDDiscoveryClient {
         await withTaskGroup(of: (String, OutputResolution?).self) { group in
             for host in hosts {
                 group.addTask { [httpClient] in
-                    guard let url = Self.stateURL(for: host) else {
+                    guard let url = Self.infoURL(for: host) else {
                         return (host, nil)
                     }
                     do {
                         let (data, response) = try await httpClient.get(url: url)
-                        guard response.statusCode == 200 else { return (host, nil) }
-                        return (host, try WLEDStateParser.outputResolution(from: data))
+                        guard response.statusCode == 200 else {
+                            Log.discovery.warning("probe \(host) http \(response.statusCode)")
+                            return (host, nil)
+                        }
+                        let resolution = try WLEDInfoParser.matrixResolution(from: data)
+                        return (host, resolution)
                     } catch {
+                        Log.discovery.warning("probe \(host) failed: \(error.localizedDescription)")
                         return (host, nil)
                     }
                 }
@@ -132,7 +148,11 @@ public actor WLEDDiscoveryClient {
 
             while let result = await group.next() {
                 if let resolution = result.1 {
+                    let previous = verifiedHosts[result.0]
                     verifiedHosts[result.0] = resolution
+                    if previous != resolution {
+                        Log.discovery.notice("verified \(result.0) \(resolution.width)x\(resolution.height)")
+                    }
                 }
             }
         }
@@ -149,16 +169,16 @@ public actor WLEDDiscoveryClient {
         continuation = nil
     }
 
-    private static func stateURL(for host: String) -> URL? {
+    private static func infoURL(for host: String) -> URL? {
         var components = URLComponents()
         components.scheme = "http"
         components.host = host.trimmingCharacters(in: .whitespacesAndNewlines)
         components.port = 80
-        components.path = "/json/state"
+        components.path = "/json/info"
         return components.url
     }
 
-    private func stateURL(for host: String) -> URL? {
-        Self.stateURL(for: host)
+    private func infoURL(for host: String) -> URL? {
+        Self.infoURL(for: host)
     }
 }

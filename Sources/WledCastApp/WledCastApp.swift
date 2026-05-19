@@ -8,8 +8,9 @@ struct WledCastApp: App {
         WindowGroup("WledCast", id: "main") {
             SettingsView()
                 .environmentObject(model)
-                .frame(width: 360, height: 520)
         }
+        .defaultSize(width: 360, height: 560)
+        .windowResizability(.contentSize)
         MenuBarExtra("WledCast", systemImage: model.isStreaming ? "dot.radiowaves.left.and.right" : "square.dashed") {
             MenuBarContent()
                 .environmentObject(model)

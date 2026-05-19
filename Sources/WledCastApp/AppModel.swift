@@ -9,7 +9,7 @@ import WledCore
 final class AppModel: ObservableObject {
     @Published var hosts: [WLEDHost] = []
     @Published var selectedHost: String = ""
-    @Published var outputResolution = OutputResolution(width: 16, height: 16)
+    @Published var outputResolution: OutputResolution?
     @Published var filters: FilterConfig = .default
     @Published var captureBox: CaptureBox = .centered(on: NSScreen.main ?? NSScreen.screens.first!)
     @Published var captureMode: CaptureMode = .region
@@ -26,6 +26,7 @@ final class AppModel: ObservableObject {
     private var session: SessionController?
     private var sender: DDPSender?
     private var source: DisplayFrameSource?
+    private var pacer: FramePacer?
     private var overlay: OverlayWindowController?
     private var boxRef: CaptureBoxRef?
     private var lastPreviewUpdate = Date.distantPast
@@ -35,6 +36,9 @@ final class AppModel: ObservableObject {
     init() {
         restore()
         startDiscovery()
+        if !selectedHost.isEmpty {
+            refreshSelectedHostResolution()
+        }
         Task { @MainActor [weak self] in
             self?.autoStart()
         }
@@ -44,8 +48,35 @@ final class AppModel: ObservableObject {
         if overlay?.window?.isVisible != true {
             toggleOverlay()
         }
-        if !isStreaming, !selectedHost.isEmpty {
+        if !isStreaming, !selectedHost.isEmpty, outputResolution != nil {
             startStreaming()
+        }
+    }
+
+    private func refreshSelectedHostResolution() {
+        let host = selectedHost
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let resolution = try await self.discovery.fetchMatrixResolution(host: host)
+                guard self.selectedHost == host else { return }
+                let previous = self.outputResolution
+                if previous != resolution {
+                    Log.app.notice("resolution updated for \(host): \(resolution.width)x\(resolution.height)")
+                    self.outputResolution = resolution
+                    self.overlay?.outputResolution = resolution
+                    self.persist()
+                    if self.isStreaming {
+                        self.restartStreaming()
+                    } else {
+                        self.autoStart()
+                    }
+                } else {
+                    self.autoStart()
+                }
+            } catch {
+                Log.app.warning("failed to fetch matrix for \(host): \(error.localizedDescription)")
+            }
         }
     }
 
@@ -56,10 +87,15 @@ final class AppModel: ObservableObject {
 
     func setHost(_ host: String) {
         selectedHost = host
+        let previous = outputResolution
         if let info = hosts.first(where: { $0.host == host }) {
             outputResolution = info.resolution
+            overlay?.outputResolution = info.resolution
         }
         persist()
+        if isStreaming, outputResolution != previous {
+            restartStreaming()
+        }
     }
 
     func setCaptureMode(_ mode: CaptureMode) {
@@ -70,6 +106,9 @@ final class AppModel: ObservableObject {
     func setFPS(_ value: Int) {
         fps = max(1, value)
         persist()
+        if isStreaming {
+            restartStreaming()
+        }
     }
 
     func setAspectLock(_ value: Bool) {
@@ -84,10 +123,22 @@ final class AppModel: ObservableObject {
         persist()
     }
 
+    private func ensureOverlayVisible() {
+        if overlay == nil {
+            toggleOverlay()
+            return
+        }
+        if overlay?.window?.isVisible != true {
+            overlay?.show()
+        }
+    }
+
     func toggleOverlay() {
         if overlay == nil {
             let controller = OverlayWindowController(captureBox: captureBox)
-            controller.outputResolution = outputResolution
+            if let resolution = outputResolution {
+                controller.outputResolution = resolution
+            }
             controller.aspectLock = aspectLock
             controller.onChange = { [weak self] box in
                 Task { @MainActor in
@@ -123,9 +174,13 @@ final class AppModel: ObservableObject {
         guard !selectedHost.isEmpty else {
             return
         }
+        guard let resolution = outputResolution else {
+            Log.app.warning("startStreaming aborted: no matrix resolution yet for \(selectedHost)")
+            return
+        }
 
-        if overlay == nil {
-            toggleOverlay()
+        if overlay == nil || overlay?.window?.isVisible != true {
+            ensureOverlayVisible()
         }
 
         let selection = CaptureSelection(
@@ -134,11 +189,13 @@ final class AppModel: ObservableObject {
         )
         let ref = CaptureBoxRef(captureBox)
         boxRef = ref
+        let excludedWindows = [overlay?.captureWindowID].compactMap { $0 }
         let frameSource = DisplayFrameSource(
             boxRef: ref,
-            outputResolution: outputResolution,
+            outputResolution: resolution,
             fps: fps,
-            captureSelection: selection
+            captureSelection: selection,
+            excludedWindowIDs: excludedWindows
         )
         frameSource.onDiagnostics = { [weak self] diag in
             Task { @MainActor in
@@ -156,7 +213,7 @@ final class AppModel: ObservableObject {
             sender = newSender
             let controller = SessionController(
                 sender: newSender,
-                outputResolution: outputResolution,
+                outputResolution: resolution,
                 filterConfig: filters
             )
             controller.onFrameProcessed = { [weak self] frame in
@@ -164,9 +221,15 @@ final class AppModel: ObservableObject {
                     self?.updatePreview(frame)
                 }
             }
-            frameSource.onFrame = { [weak controller] frame in
+            let newPacer = FramePacer()
+            newPacer.onTick = { [weak controller] frame in
                 controller?.process(frame: frame)
             }
+            frameSource.onFrame = { [weak newPacer] frame in
+                newPacer?.ingest(frame)
+            }
+            newPacer.start(fps: fps)
+            pacer = newPacer
             session = controller
             isStreaming = true
         } catch {
@@ -182,6 +245,8 @@ final class AppModel: ObservableObject {
     func stopStreaming() {
         source?.stop()
         source = nil
+        pacer?.stop()
+        pacer = nil
         session?.stop()
         session = nil
         sender?.stop()
@@ -201,14 +266,22 @@ final class AppModel: ObservableObject {
             for await discovered in stream {
                 await MainActor.run {
                     self.hosts = discovered
+                    let previous = self.outputResolution
                     if self.selectedHost.isEmpty, let first = discovered.first {
                         self.selectedHost = first.host
                         self.outputResolution = first.resolution
                     } else if let selected = discovered.first(where: { $0.host == self.selectedHost }) {
                         self.outputResolution = selected.resolution
                     }
+                    if let resolution = self.outputResolution {
+                        self.overlay?.outputResolution = resolution
+                    }
                     self.persist()
-                    self.autoStart()
+                    if self.isStreaming, self.outputResolution != previous {
+                        self.restartStreaming()
+                    } else {
+                        self.autoStart()
+                    }
                 }
             }
         }
@@ -240,6 +313,9 @@ final class AppModel: ObservableObject {
         defaults.set(fps, forKey: "fps")
         defaults.set(aspectLock, forKey: "aspectLock")
         defaults.set(captureMode.rawValue, forKey: "captureMode")
+        if let resolution = outputResolution, let data = try? JSONEncoder().encode(resolution) {
+            defaults.set(data, forKey: "outputResolution")
+        }
         if let filterData = try? JSONEncoder().encode(filters) {
             defaults.set(filterData, forKey: "filters")
         }
@@ -257,6 +333,12 @@ final class AppModel: ObservableObject {
         aspectLock = defaults.object(forKey: "aspectLock") as? Bool ?? true
         if let modeRaw = defaults.string(forKey: "captureMode"), let mode = CaptureMode(rawValue: modeRaw) {
             captureMode = mode
+        }
+        if
+            let resData = defaults.data(forKey: "outputResolution"),
+            let decoded = try? JSONDecoder().decode(OutputResolution.self, from: resData)
+        {
+            outputResolution = decoded
         }
         if
             let filterData = defaults.data(forKey: "filters"),

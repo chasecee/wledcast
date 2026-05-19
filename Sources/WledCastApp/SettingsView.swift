@@ -3,7 +3,6 @@ import WledCore
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var manualHost: String = ""
     @State private var saturation: Double = Double(FilterConfig.default.saturation)
     @State private var brightness: Double = Double(FilterConfig.default.brightness)
     @State private var contrast: Double = Double(FilterConfig.default.contrast)
@@ -15,14 +14,10 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                GroupBox("Output") {
+                GroupBox("Capture") {
                     VStack(alignment: .leading, spacing: 10) {
-                        TextField("Host", text: $manualHost)
-                        Button("Use Host") {
-                            model.setHost(manualHost.trimmingCharacters(in: .whitespacesAndNewlines))
-                        }
                         HStack {
-                            Text("Capture Mode")
+                            Text("Mode")
                             Spacer()
                             Picker("Capture Mode", selection: Binding(
                                 get: { model.captureMode },
@@ -51,23 +46,29 @@ struct SettingsView: View {
                             set: { model.setAspectLock($0) }
                         ))
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 GroupBox("Transmit Preview") {
                     VStack(alignment: .leading, spacing: 8) {
+                        let aspect: CGFloat = {
+                            if let r = model.outputResolution, r.height > 0 {
+                                return CGFloat(r.width) / CGFloat(r.height)
+                            }
+                            return 1
+                        }()
                         if let image = model.txPreviewImage {
                             Image(nsImage: image)
                                 .resizable()
                                 .interpolation(.none)
-                                .scaledToFit()
+                                .aspectRatio(aspect, contentMode: .fit)
                                 .frame(maxWidth: .infinity)
-                                .frame(height: 110)
-                                .background(Color.black.opacity(0.15))
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                         } else {
                             RoundedRectangle(cornerRadius: 6)
                                 .fill(Color.black.opacity(0.15))
-                                .frame(height: 110)
+                                .aspectRatio(aspect, contentMode: .fit)
+                                .frame(maxWidth: .infinity)
                                 .overlay(Text("No frame yet").foregroundStyle(.secondary))
                         }
                         Text(model.txPreviewInfo)
@@ -80,6 +81,7 @@ struct SettingsView: View {
                                 .textSelection(.enabled)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 GroupBox("Filters") {
@@ -92,12 +94,14 @@ struct SettingsView: View {
                         slider("Balance G", value: $balanceG, range: 0...2)
                         slider("Balance B", value: $balanceB, range: 0...2)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
+            .frame(maxWidth: .infinity)
             .padding(14)
         }
+        .frame(minWidth: 320, idealWidth: 360, minHeight: 420, idealHeight: 560)
         .onAppear {
-            manualHost = model.selectedHost
             saturation = Double(model.filters.saturation)
             brightness = Double(model.filters.brightness)
             contrast = Double(model.filters.contrast)
