@@ -2,5 +2,11 @@
 .idea
 dist
 build
+.build
+DerivedData
+.DS_Store
 **egg**
 *.spec
+Resources/WledCast.iconset/
+*.log
+logs/
