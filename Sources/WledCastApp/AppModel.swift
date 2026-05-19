@@ -11,7 +11,7 @@ final class AppModel: ObservableObject {
     @Published var selectedHost: String = ""
     @Published var outputResolution = OutputResolution(width: 16, height: 16)
     @Published var filters: FilterConfig = .default
-    @Published var captureBox = CaptureBox(left: 50, top: 50, width: 500, height: 500)
+    @Published var captureBox: CaptureBox = .centered(on: NSScreen.main ?? NSScreen.screens.first!)
     @Published var captureMode: CaptureMode = .region
     @Published var fps: Int = 30
     @Published var aspectLock = true
@@ -19,12 +19,13 @@ final class AppModel: ObservableObject {
     @Published var senderState: DDPSenderState = .stopped
     @Published var txPreviewImage: NSImage?
     @Published var txPreviewInfo: String = "No frames yet"
+    @Published var captureDiagnostics: String = ""
 
     private let discovery = WLEDDiscoveryClient()
     private var discoveryTask: Task<Void, Never>?
-    private var streamTask: Task<Void, Never>?
     private var session: SessionController?
     private var sender: DDPSender?
+    private var source: DisplayFrameSource?
     private var overlay: OverlayWindowController?
     private var boxRef: CaptureBoxRef?
     private var lastPreviewUpdate = Date.distantPast
@@ -34,9 +35,17 @@ final class AppModel: ObservableObject {
     init() {
         restore()
         startDiscovery()
-        if selectedHost.isEmpty, let first = hosts.first {
-            selectedHost = first.host
-            outputResolution = first.resolution
+        Task { @MainActor [weak self] in
+            self?.autoStart()
+        }
+    }
+
+    private func autoStart() {
+        if overlay?.window?.isVisible != true {
+            toggleOverlay()
+        }
+        if !isStreaming, !selectedHost.isEmpty {
+            startStreaming()
         }
     }
 
@@ -82,9 +91,17 @@ final class AppModel: ObservableObject {
             controller.aspectLock = aspectLock
             controller.onChange = { [weak self] box in
                 Task { @MainActor in
-                    self?.captureBox = box
-                    self?.boxRef?.update(box)
-                    self?.persist()
+                    guard let self else { return }
+                    let displayChanged = self.captureBox.displayID != box.displayID
+                    self.captureBox = box
+                    self.boxRef?.update(box)
+                    self.persist()
+                    guard self.isStreaming else { return }
+                    if displayChanged {
+                        self.restartStreaming()
+                    } else {
+                        self.source?.updateRegion(box: box)
+                    }
                 }
             }
             overlay = controller
@@ -111,15 +128,24 @@ final class AppModel: ObservableObject {
             toggleOverlay()
         }
 
-        let selection = CaptureSelection(mode: captureMode)
+        let selection = CaptureSelection(
+            mode: captureMode,
+            displayID: captureMode == .region ? captureBox.displayID : nil
+        )
         let ref = CaptureBoxRef(captureBox)
         boxRef = ref
-        let source = DisplayFrameSource(
+        let frameSource = DisplayFrameSource(
             boxRef: ref,
             outputResolution: outputResolution,
             fps: fps,
             captureSelection: selection
         )
+        frameSource.onDiagnostics = { [weak self] diag in
+            Task { @MainActor in
+                self?.captureDiagnostics = format(diagnostics: diag)
+            }
+        }
+        source = frameSource
         do {
             let newSender = try DDPSender(host: selectedHost)
             newSender.onStateChanged = { [weak self] state in
@@ -129,33 +155,33 @@ final class AppModel: ObservableObject {
             }
             sender = newSender
             let controller = SessionController(
-                frameSource: source,
                 sender: newSender,
                 outputResolution: outputResolution,
-                filterConfig: filters,
-                fps: fps
+                filterConfig: filters
             )
             controller.onFrameProcessed = { [weak self] frame in
                 Task { @MainActor in
                     self?.updatePreview(frame)
                 }
             }
+            frameSource.onFrame = { [weak controller] frame in
+                controller?.process(frame: frame)
+            }
             session = controller
             isStreaming = true
-            streamTask = Task { [weak self] in
-                await controller.start()
-                await MainActor.run {
-                    self?.isStreaming = false
-                }
-            }
         } catch {
             senderState = .failed(error.localizedDescription)
         }
     }
 
+    private func restartStreaming() {
+        stopStreaming()
+        startStreaming()
+    }
+
     func stopStreaming() {
-        streamTask?.cancel()
-        streamTask = nil
+        source?.stop()
+        source = nil
         session?.stop()
         session = nil
         sender?.stop()
@@ -163,6 +189,7 @@ final class AppModel: ObservableObject {
         isStreaming = false
         txPreviewInfo = "No frames yet"
         txPreviewImage = nil
+        captureDiagnostics = ""
     }
 
     private func startDiscovery() {
@@ -181,6 +208,7 @@ final class AppModel: ObservableObject {
                         self.outputResolution = selected.resolution
                     }
                     self.persist()
+                    self.autoStart()
                 }
             }
         }
@@ -284,4 +312,12 @@ final class AppModel: ObservableObject {
         }
         return NSImage(cgImage: cgImage, size: NSSize(width: frame.width, height: frame.height))
     }
+}
+
+private func format(diagnostics diag: DisplayFrameSource.Diagnostics) -> String {
+    let displayPart = "display \(diag.displayID)"
+    let framePart = "frame \(Int(diag.framePixels.width))x\(Int(diag.framePixels.height)) px"
+    let srcPart = "src \(Int(diag.sourceRect.minX)),\(Int(diag.sourceRect.minY)) \(Int(diag.sourceRect.width))x\(Int(diag.sourceRect.height)) pt"
+    let countPart = "\(diag.deliveredFrames) frames"
+    return [displayPart, framePart, srcPart, countPart].joined(separator: "  ·  ")
 }

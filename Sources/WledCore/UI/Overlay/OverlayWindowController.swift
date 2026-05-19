@@ -13,10 +13,21 @@ public final class OverlayWindowController: NSWindowController {
     private var monitor: Any?
 
     public init(captureBox: CaptureBox) {
-        self.captureBox = captureBox
-        let rect = NSRect(x: captureBox.left, y: captureBox.top, width: captureBox.width, height: captureBox.height)
+        let initialScreen = NSScreen.screen(for: captureBox.displayID)
+            ?? NSScreen.main
+            ?? NSScreen.screens.first!
+        let resolved: CaptureBox
+        let initialFrame: NSRect
+        if NSScreen.screen(for: captureBox.displayID) != nil {
+            resolved = captureBox
+            initialFrame = captureBox.nsRect(on: initialScreen)
+        } else {
+            resolved = CaptureBox.centered(on: initialScreen)
+            initialFrame = resolved.nsRect(on: initialScreen)
+        }
+        self.captureBox = resolved
         let window = OverlayPanel(
-            contentRect: rect,
+            contentRect: initialFrame,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -159,12 +170,10 @@ public final class OverlayWindowController: NSWindowController {
     }
 
     fileprivate func updateBox(from frame: NSRect) {
-        captureBox = CaptureBox(
-            left: Int(frame.minX),
-            top: Int(frame.minY),
-            width: Int(frame.width),
-            height: Int(frame.height)
-        )
+        let screen = NSScreen.screens.max {
+            $0.frame.intersection(frame).rectArea < $1.frame.intersection(frame).rectArea
+        } ?? NSScreen.main ?? NSScreen.screens.first!
+        captureBox = CaptureBox(nsFrame: frame, screen: screen)
         onChange?(captureBox)
     }
 
@@ -250,6 +259,10 @@ public final class OverlayWindowController: NSWindowController {
 private final class OverlayPanel: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+}
+
+private extension NSRect {
+    var rectArea: CGFloat { isNull ? 0 : width * height }
 }
 
 public enum OverlayHandle: CaseIterable {

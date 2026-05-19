@@ -1,12 +1,14 @@
 import Foundation
 
 public struct CaptureBox: Codable, Equatable, Sendable {
+    public var displayID: UInt32
     public var left: Int
     public var top: Int
     public var width: Int
     public var height: Int
 
-    public init(left: Int, top: Int, width: Int, height: Int) {
+    public init(displayID: UInt32, left: Int, top: Int, width: Int, height: Int) {
+        self.displayID = displayID
         self.left = left
         self.top = top
         self.width = width

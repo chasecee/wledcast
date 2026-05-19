@@ -73,6 +73,12 @@ struct SettingsView: View {
                         Text(model.txPreviewInfo)
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.secondary)
+                        if !model.captureDiagnostics.isEmpty {
+                            Text(model.captureDiagnostics)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
                     }
                 }
 

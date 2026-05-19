@@ -90,27 +90,32 @@ public actor WLEDDiscoveryClient {
     }
 
     private func ingest(results: Set<NWBrowser.Result>) async {
-        var changed = false
+        var newHosts = Set<String>()
         for result in results {
             switch result.endpoint {
             case let .service(name: name, type: _, domain: domain, interface: _):
                 if domain == "local" || domain == "local." {
-                    changed = hostCandidates.insert("\(name).local").inserted || changed
+                    let candidate = "\(name).local"
+                    if hostCandidates.insert(candidate).inserted {
+                        newHosts.insert(candidate)
+                    }
                 }
             case let .hostPort(host, _):
                 let normalized = host.debugDescription.replacingOccurrences(of: "\"", with: "")
-                changed = hostCandidates.insert(normalized).inserted || changed
+                if hostCandidates.insert(normalized).inserted {
+                    newHosts.insert(normalized)
+                }
             default:
                 break
             }
         }
-        guard changed else { return }
-        await probeCandidates()
+        guard !newHosts.isEmpty else { return }
+        await probeNewHosts(newHosts)
     }
 
-    private func probeCandidates() async {
+    private func probeNewHosts(_ hosts: Set<String>) async {
         await withTaskGroup(of: (String, OutputResolution?).self) { group in
-            for host in hostCandidates {
+            for host in hosts {
                 group.addTask { [httpClient] in
                     guard let url = Self.stateURL(for: host) else {
                         return (host, nil)
@@ -128,8 +133,6 @@ public actor WLEDDiscoveryClient {
             while let result = await group.next() {
                 if let resolution = result.1 {
                     verifiedHosts[result.0] = resolution
-                } else {
-                    verifiedHosts.removeValue(forKey: result.0)
                 }
             }
         }

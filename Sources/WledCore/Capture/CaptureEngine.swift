@@ -4,11 +4,6 @@ import CoreVideo
 import Foundation
 import ScreenCaptureKit
 
-public protocol FrameSource {
-    func capture() throws -> RGBFrame
-    func stop()
-}
-
 public final class CaptureBoxRef: @unchecked Sendable {
     private let lock = NSLock()
     private var value: CaptureBox
@@ -28,34 +23,29 @@ public final class CaptureBoxRef: @unchecked Sendable {
     }
 }
 
-private final class LatestFrameStore: @unchecked Sendable {
-    private let lock = NSLock()
-    private var frame: RGBFrame?
-
-    func write(_ frame: RGBFrame) {
-        lock.lock()
-        self.frame = frame
-        lock.unlock()
+public final class DisplayFrameSource {
+    public struct Diagnostics: Equatable, Sendable {
+        public var displayID: UInt32
+        public var framePixels: CGSize
+        public var sourceRect: CGRect
+        public var deliveredFrames: Int
     }
 
-    func read() -> RGBFrame? {
-        lock.lock()
-        let value = frame
-        lock.unlock()
-        return value
-    }
-}
+    public var onFrame: ((RGBFrame) -> Void)?
+    public var onDiagnostics: ((Diagnostics) -> Void)?
 
-public final class DisplayFrameSource: FrameSource {
     private let boxRef: CaptureBoxRef
     private let outputResolution: OutputResolution
     private let fps: Int
     private let captureSelection: CaptureSelection
-    private let store = LatestFrameStore()
     private let streamOutput = StreamOutput()
     private var stream: SCStream?
-    private let queue = DispatchQueue(label: "wledcast.capture.output")
-    private var activeDisplayBounds = CGRect.zero
+    private var streamConfiguration: SCStreamConfiguration?
+    private let queue = DispatchQueue(label: "wledcast.capture.output", qos: .userInteractive)
+    private var activeDisplayID: CGDirectDisplayID = 0
+    private var rgbScratch: [UInt8]
+    private var deliveredFrames = 0
+    private var lastDiagnosticsAt = Date.distantPast
 
     public init(
         boxRef: CaptureBoxRef,
@@ -67,6 +57,7 @@ public final class DisplayFrameSource: FrameSource {
         self.outputResolution = outputResolution
         self.fps = max(1, fps)
         self.captureSelection = captureSelection
+        self.rgbScratch = [UInt8](repeating: 0, count: max(1, outputResolution.width * outputResolution.height * 3))
         streamOutput.onSampleBuffer = { [weak self] sampleBuffer in
             self?.consume(sampleBuffer: sampleBuffer)
         }
@@ -75,17 +66,29 @@ public final class DisplayFrameSource: FrameSource {
         }
     }
 
-    public func capture() throws -> RGBFrame {
-        guard let frame = store.read() else {
-            throw NSError(domain: "DisplayFrameSource", code: 1)
-        }
-        return frame
-    }
-
     public func stop() {
         Task { [stream] in
             try? await stream?.stopCapture()
         }
+    }
+
+    public func updateRegion(box: CaptureBox) {
+        guard captureSelection.mode == .region else { return }
+        guard box.displayID == activeDisplayID else { return }
+        guard let stream, let configuration = streamConfiguration else { return }
+        configuration.sourceRect = sourceRect(for: box)
+        Task {
+            try? await stream.updateConfiguration(configuration)
+        }
+    }
+
+    private func sourceRect(for box: CaptureBox) -> CGRect {
+        CGRect(
+            x: CGFloat(box.left),
+            y: CGFloat(box.top),
+            width: CGFloat(max(1, box.width)),
+            height: CGFloat(max(1, box.height))
+        )
     }
 
     private func startStream() async throws {
@@ -93,23 +96,27 @@ public final class DisplayFrameSource: FrameSource {
         let (filter, displayID) = try buildFilter(content: content)
 
         let configuration = SCStreamConfiguration()
-        if captureSelection.mode == .region {
-            let fullWidth = max(1, Int(CGDisplayPixelsWide(displayID)))
-            let fullHeight = max(1, Int(CGDisplayPixelsHigh(displayID)))
-            configuration.width = fullWidth
-            configuration.height = fullHeight
-        } else {
-            configuration.width = outputResolution.width
-            configuration.height = outputResolution.height
-        }
+        configuration.width = max(1, outputResolution.width)
+        configuration.height = max(1, outputResolution.height)
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
-        activeDisplayBounds = CGDisplayBounds(displayID)
+        configuration.scalesToFit = false
+        configuration.showsCursor = false
+        configuration.queueDepth = 3
+        if captureSelection.mode == .region {
+            configuration.sourceRect = sourceRect(for: boxRef.box)
+        }
+
+        activeDisplayID = displayID
+        Log.capture.notice(
+            "stream display=\(displayID) src=\(configuration.sourceRect) out=\(configuration.width)x\(configuration.height) fps=\(fps)"
+        )
 
         let newStream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         try newStream.addStreamOutput(streamOutput, type: .screen, sampleHandlerQueue: queue)
         try await newStream.startCapture()
         stream = newStream
+        streamConfiguration = configuration
     }
 
     private func buildFilter(content: SCShareableContent) throws -> (SCContentFilter, CGDirectDisplayID) {
@@ -146,82 +153,48 @@ public final class DisplayFrameSource: FrameSource {
         guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let buffer = baseAddress.assumingMemoryBound(to: UInt8.self)
 
-        var rgb = [UInt8](repeating: 0, count: width * height * 3)
-        for y in 0..<height {
-            let row = buffer + (y * bytesPerRow)
-            for x in 0..<width {
-                let source = row + (x * 4)
-                let target = (y * width + x) * 3
-                rgb[target] = source[2]
-                rgb[target + 1] = source[1]
-                rgb[target + 2] = source[0]
+        let rgbCount = width * height * 3
+        if rgbScratch.count != rgbCount {
+            rgbScratch = [UInt8](repeating: 0, count: rgbCount)
+        }
+        rgbScratch.withUnsafeMutableBufferPointer { rgbPtr in
+            guard let dst = rgbPtr.baseAddress else { return }
+            for y in 0..<height {
+                let row = buffer.advanced(by: y * stride)
+                let outRow = dst.advanced(by: y * width * 3)
+                for x in 0..<width {
+                    let s = x * 4
+                    let d = x * 3
+                    outRow[d] = row[s + 2]
+                    outRow[d + 1] = row[s + 1]
+                    outRow[d + 2] = row[s]
+                }
             }
         }
-        var frame = RGBFrame(width: width, height: height, pixels: rgb)
-        if captureSelection.mode == .region {
-            frame = cropRegion(frame: frame, box: boxRef.box)
-        }
-        store.write(frame)
+
+        deliveredFrames += 1
+        let frame = RGBFrame(width: width, height: height, pixels: rgbScratch)
+        onFrame?(frame)
+        emitDiagnosticsIfDue(framePixels: CGSize(width: width, height: height))
     }
 
-    private func cropRegion(frame: RGBFrame, box: CaptureBox) -> RGBFrame {
-        let bounds = activeDisplayBounds
-        guard bounds.width > 0, bounds.height > 0 else {
-            return frame
-        }
-
-        let scaleX = Double(frame.width) / Double(bounds.width)
-        let scaleY = Double(frame.height) / Double(bounds.height)
-
-        let x0 = Int((Double(box.left) - bounds.minX) * scaleX)
-        let y0FromBottom = Int((Double(box.top) - bounds.minY) * scaleY)
-        let width = max(1, Int(Double(box.width) * scaleX))
-        let height = max(1, Int(Double(box.height) * scaleY))
-
-        let x = max(0, min(frame.width - 1, x0))
-        var y = frame.height - y0FromBottom - height
-        y = max(0, min(frame.height - 1, y))
-
-        var cropWidth = min(width, frame.width - x)
-        var cropHeight = min(height, frame.height - y)
-        cropWidth = max(1, cropWidth)
-        cropHeight = max(1, cropHeight)
-
-        var cropped = [UInt8](repeating: 0, count: cropWidth * cropHeight * 3)
-        for row in 0..<cropHeight {
-            let sourceStart = ((y + row) * frame.width + x) * 3
-            let sourceEnd = sourceStart + (cropWidth * 3)
-            let targetStart = row * cropWidth * 3
-            cropped.replaceSubrange(targetStart..<(targetStart + (cropWidth * 3)), with: frame.pixels[sourceStart..<sourceEnd])
-        }
-
-        let out = RGBFrame(width: cropWidth, height: cropHeight, pixels: cropped)
-        if out.width == outputResolution.width, out.height == outputResolution.height {
-            return out
-        }
-        return resizeNearest(frame: out, targetWidth: outputResolution.width, targetHeight: outputResolution.height)
-    }
-
-    private func resizeNearest(frame: RGBFrame, targetWidth: Int, targetHeight: Int) -> RGBFrame {
-        if frame.width == targetWidth, frame.height == targetHeight {
-            return frame
-        }
-        var targetPixels = [UInt8](repeating: 0, count: targetWidth * targetHeight * 3)
-        for y in 0..<targetHeight {
-            let sourceY = min(frame.height - 1, y * frame.height / targetHeight)
-            for x in 0..<targetWidth {
-                let sourceX = min(frame.width - 1, x * frame.width / targetWidth)
-                let sourceIndex = (sourceY * frame.width + sourceX) * 3
-                let targetIndex = (y * targetWidth + x) * 3
-                targetPixels[targetIndex] = frame.pixels[sourceIndex]
-                targetPixels[targetIndex + 1] = frame.pixels[sourceIndex + 1]
-                targetPixels[targetIndex + 2] = frame.pixels[sourceIndex + 2]
-            }
-        }
-        return RGBFrame(width: targetWidth, height: targetHeight, pixels: targetPixels)
+    private func emitDiagnosticsIfDue(framePixels: CGSize) {
+        let now = Date()
+        guard now.timeIntervalSince(lastDiagnosticsAt) > 0.5 else { return }
+        lastDiagnosticsAt = now
+        let diag = Diagnostics(
+            displayID: activeDisplayID,
+            framePixels: framePixels,
+            sourceRect: streamConfiguration?.sourceRect ?? .zero,
+            deliveredFrames: deliveredFrames
+        )
+        onDiagnostics?(diag)
+        Log.capture.notice(
+            "tick display=\(diag.displayID) frame=\(Int(framePixels.width))x\(Int(framePixels.height)) src=\(diag.sourceRect) delivered=\(deliveredFrames)"
+        )
     }
 }
 
@@ -232,18 +205,4 @@ private final class StreamOutput: NSObject, SCStreamOutput {
         guard outputType == .screen else { return }
         onSampleBuffer?(sampleBuffer)
     }
-}
-
-public struct SyntheticFrameSource: FrameSource {
-    private let frame: RGBFrame
-
-    public init(frame: RGBFrame) {
-        self.frame = frame
-    }
-
-    public func capture() throws -> RGBFrame {
-        frame
-    }
-
-    public func stop() {}
 }

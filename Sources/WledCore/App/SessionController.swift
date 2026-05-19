@@ -1,56 +1,37 @@
 import Foundation
 
-public final class SessionController {
-    private let frameSource: FrameSource
+public final class SessionController: @unchecked Sendable {
     private let sender: DDPSender
     private let outputResolution: OutputResolution
+    private let filterLock = NSLock()
     private var filterConfig: FilterConfig
-    private let fps: Int
-    private var running = false
+
     public var onFrameProcessed: ((RGBFrame) -> Void)?
 
     public init(
-        frameSource: FrameSource,
         sender: DDPSender,
         outputResolution: OutputResolution,
-        filterConfig: FilterConfig,
-        fps: Int
+        filterConfig: FilterConfig
     ) {
-        self.frameSource = frameSource
         self.sender = sender
         self.outputResolution = outputResolution
         self.filterConfig = filterConfig
-        self.fps = max(1, fps)
     }
 
     public func updateFilters(_ config: FilterConfig) {
-        filterConfig = config
+        filterLock.lock(); filterConfig = config; filterLock.unlock()
     }
 
-    public func start() async {
-        running = true
-        let period = UInt64(1_000_000_000 / fps)
-        while running, !Task.isCancelled {
-            let start = DispatchTime.now().uptimeNanoseconds
-            if let frame = try? frameSource.capture() {
-                let processed = FramePipeline.process(
-                    frame: frame,
-                    output: outputResolution,
-                    filters: filterConfig
-                )
-                onFrameProcessed?(processed)
-                sender.send(frame: processed)
-            }
-            let elapsed = DispatchTime.now().uptimeNanoseconds - start
-            if elapsed < period {
-                try? await Task.sleep(nanoseconds: period - elapsed)
-            }
-        }
+    public func process(frame: RGBFrame) {
+        filterLock.lock()
+        let cfg = filterConfig
+        filterLock.unlock()
+        let processed = FramePipeline.process(frame: frame, output: outputResolution, filters: cfg)
+        onFrameProcessed?(processed)
+        sender.send(frame: processed)
     }
 
     public func stop() {
-        running = false
-        frameSource.stop()
         sender.stop()
     }
 }
