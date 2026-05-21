@@ -87,15 +87,20 @@ final class AppModel: ObservableObject {
     }
 
     func setHost(_ host: String) {
+        let hostChanged = host != selectedHost
         selectedHost = host
-        let previous = outputResolution
         if let info = hosts.first(where: { $0.host == host }) {
             outputResolution = info.resolution
             overlay?.outputResolution = info.resolution
+        } else {
+            outputResolution = nil
         }
         persist()
-        if isStreaming, outputResolution != previous {
+        guard hostChanged else { return }
+        if isStreaming {
             restartStreaming()
+        } else {
+            autoStart()
         }
     }
 
@@ -251,6 +256,7 @@ final class AppModel: ObservableObject {
     }
 
     func stopStreaming() {
+        session?.blackout()
         source?.stop()
         source = nil
         pacer?.stop()

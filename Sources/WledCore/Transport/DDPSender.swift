@@ -13,6 +13,8 @@ public final class DDPSender: @unchecked Sendable {
     private let port: NWEndpoint.Port
     private var packetizer = DDPPacketizer()
     private let queue = DispatchQueue(label: "wledcast.ddp.sender")
+    private let queueKey = DispatchSpecificKey<UInt8>()
+    private let queueToken: UInt8 = 1
     private var connection: NWConnection?
     private var reconnectTask: DispatchWorkItem?
     public var onStateChanged: (@Sendable (DDPSenderState) -> Void)?
@@ -23,6 +25,7 @@ public final class DDPSender: @unchecked Sendable {
         }
         self.host = NWEndpoint.Host(host)
         self.port = nwPort
+        queue.setSpecific(key: queueKey, value: queueToken)
         queue.async { [weak self] in
             self?.connect()
         }
@@ -47,14 +50,18 @@ public final class DDPSender: @unchecked Sendable {
     }
 
     public func stop() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.reconnectTask?.cancel()
-            self.reconnectTask = nil
-            self.connection?.cancel()
-            self.connection = nil
-            self.onStateChanged?(.stopped)
+        if DispatchQueue.getSpecific(key: queueKey) == queueToken {
+            stopOnQueue()
+            return
         }
+        queue.sync {
+            stopOnQueue()
+        }
+    }
+
+    public func sendBlackout(pixelCount: Int) {
+        guard pixelCount > 0 else { return }
+        sendRaw(Data(repeating: 0, count: pixelCount * 3))
     }
 
     private func connect() {
@@ -97,5 +104,13 @@ public final class DDPSender: @unchecked Sendable {
         }
         reconnectTask = work
         queue.asyncAfter(deadline: .now() + 1.2, execute: work)
+    }
+
+    private func stopOnQueue() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        connection?.cancel()
+        connection = nil
+        onStateChanged?(.stopped)
     }
 }

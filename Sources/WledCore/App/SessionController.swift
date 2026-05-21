@@ -41,6 +41,16 @@ public final class SessionController: @unchecked Sendable {
         sender.send(frame: smoothed)
     }
 
+    public func blackout() {
+        let payloadCount = max(1, outputResolution.width * outputResolution.height * 3)
+        let blackFrame = RGBFrame(
+            width: outputResolution.width,
+            height: outputResolution.height,
+            pixels: [UInt8](repeating: 0, count: payloadCount)
+        )
+        sender.send(frame: blackFrame)
+    }
+
     public func stop() {
         sender.stop()
     }
