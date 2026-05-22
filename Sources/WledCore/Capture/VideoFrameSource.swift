@@ -34,6 +34,7 @@ public final class VideoFrameSource: @unchecked Sendable {
     private var rangeStartSeconds: Double = 0
     private var mutedPlayback = false
     private var wallClockAnchor: (media: CMTime, wall: CFAbsoluteTime)?
+    private var lastTargetTime: CMTime = .invalid
 
     public init(
         url: URL,
@@ -284,6 +285,7 @@ public final class VideoFrameSource: @unchecked Sendable {
         self.heldSample = nil
         self.pendingSample = nil
         self.wallClockStart = CFAbsoluteTimeGetCurrent()
+        self.lastTargetTime = .invalid
         lock.unlock()
     }
 
@@ -312,11 +314,10 @@ public final class VideoFrameSource: @unchecked Sendable {
 
     private func tick() {
         guard let sampleBuffer = sampleForCurrentTime() else {
-            if loop, restartReaderIfNeeded(), let retry = sampleForCurrentTime() {
-                emit(retry)
+            guard loop else {
+                stop()
                 return
             }
-            stop()
             return
         }
         emit(sampleBuffer)
@@ -328,10 +329,15 @@ public final class VideoFrameSource: @unchecked Sendable {
             do {
                 try startReader(at: target)
             } catch {
-                return heldSample
+                lock.lock()
+                lastTargetTime = target
+                let sample = heldSample
+                lock.unlock()
+                return sample
             }
         }
         lock.lock()
+        lastTargetTime = target
         let output = self.output
         var best = heldSample
         lock.unlock()
@@ -353,7 +359,8 @@ public final class VideoFrameSource: @unchecked Sendable {
                 heldSample = nil
                 pendingSample = nil
                 lock.unlock()
-                guard restartReaderIfNeeded() else { return best }
+                if best != nil { return best }
+                guard restartReaderIfNeeded() else { return nil }
                 lock.lock()
                 best = heldSample
                 lock.unlock()
@@ -378,6 +385,9 @@ public final class VideoFrameSource: @unchecked Sendable {
     private func needsReaderReset(for target: CMTime) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        if CMTIME_IS_VALID(lastTargetTime), CMTimeCompare(target, lastTargetTime) < 0 {
+            return true
+        }
         guard let heldSample else { return false }
         let heldPTS = CMSampleBufferGetPresentationTimeStamp(heldSample)
         return CMTimeCompare(target, heldPTS) < 0

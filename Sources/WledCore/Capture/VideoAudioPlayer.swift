@@ -7,6 +7,7 @@ public final class VideoAudioPlayer {
     private var loop: Bool
     private var loopRange: LoopRange
     private var endObserver: NSObjectProtocol?
+    private var rangeEndObserver: Any?
     private var isLoopingSeek = false
     private var playbackRate: Float = 1
     private var isMuted = false
@@ -84,6 +85,7 @@ public final class VideoAudioPlayer {
     public func updateLoopRange(_ range: LoopRange) {
         loopRange = range.clamped()
         player.currentItem?.forwardPlaybackEndTime = rangeEndTime()
+        installRangeEndObserver()
         seekToRangeStart { [weak self] in
             guard let self else { return }
             if self.isMuted {
@@ -194,6 +196,26 @@ public final class VideoAudioPlayer {
         ) { [weak self] _ in
             self?.handleReachedEnd()
         }
+        installRangeEndObserver()
+    }
+
+    private func installRangeEndObserver() {
+        removeRangeEndObserver()
+        guard loop else { return }
+        let end = rangeEndTime()
+        rangeEndObserver = player.addBoundaryTimeObserver(
+            forTimes: [NSValue(time: end)],
+            queue: .main
+        ) { [weak self] in
+            self?.handleReachedEnd()
+        }
+    }
+
+    private func removeRangeEndObserver() {
+        if let rangeEndObserver {
+            player.removeTimeObserver(rangeEndObserver)
+            self.rangeEndObserver = nil
+        }
     }
 
     private func handleReachedEnd() {
@@ -218,5 +240,6 @@ public final class VideoAudioPlayer {
     private func removeObservers() {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
+        removeRangeEndObserver()
     }
 }
