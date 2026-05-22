@@ -43,10 +43,11 @@ public final class DisplayFrameSource {
     private let streamOutput = StreamOutput()
     private var stream: SCStream?
     private var streamConfiguration: SCStreamConfiguration?
-    private let queue = DispatchQueue(label: "wledcast.capture.output", qos: .userInteractive)
+    private let queue = DispatchQueue(label: "wledcast.capture.output", qos: .userInitiated)
     private var activeDisplayID: CGDirectDisplayID = 0
     private var activeSourcePixels: (width: Int, height: Int) = (1, 1)
     private var deliveredFrames = 0
+    private var lastDeliveredFrames = 0
     private var lastDiagnosticsAt = Date.distantPast
 
     public init(
@@ -163,14 +164,10 @@ public final class DisplayFrameSource {
     }
 
     private func pickOversample(sourcePixels: (width: Int, height: Int)) -> Int {
-        let xCap = sourcePixels.width / max(1, outputResolution.width * 2)
-        let yCap = sourcePixels.height / max(1, outputResolution.height * 2)
+        let xCap = sourcePixels.width / max(1, outputResolution.width)
+        let yCap = sourcePixels.height / max(1, outputResolution.height)
         let cap = max(1, min(xCap, yCap))
-        if cap >= 8 { return 8 }
-        if cap >= 6 { return 6 }
-        if cap >= 4 { return 4 }
-        if cap >= 3 { return 3 }
-        return 2
+        return min(3, cap)
     }
 
     private func backingScale(for displayID: CGDirectDisplayID) -> CGFloat {
@@ -200,16 +197,28 @@ public final class DisplayFrameSource {
     private func emitDiagnosticsIfDue(framePixels: CGSize) {
         let now = Date()
         guard now.timeIntervalSince(lastDiagnosticsAt) > 0.5 else { return }
+        let elapsed = now.timeIntervalSince(lastDiagnosticsAt)
+        let deltaFrames = deliveredFrames - lastDeliveredFrames
+        lastDeliveredFrames = deliveredFrames
         lastDiagnosticsAt = now
+        let sourceRect = streamConfiguration?.sourceRect ?? .zero
+        let streamFps = elapsed > 0 ? Double(deltaFrames) / elapsed : 0
+        PerfLog.noteCapture(
+            frameWidth: Int(framePixels.width),
+            frameHeight: Int(framePixels.height),
+            sourceRect: sourceRect,
+            output: outputResolution,
+            streamFps: streamFps
+        )
         let diag = Diagnostics(
             displayID: activeDisplayID,
             framePixels: framePixels,
-            sourceRect: streamConfiguration?.sourceRect ?? .zero,
+            sourceRect: sourceRect,
             deliveredFrames: deliveredFrames
         )
         onDiagnostics?(diag)
         Log.capture.notice(
-            "tick display=\(diag.displayID) frame=\(Int(framePixels.width))x\(Int(framePixels.height)) src=\(diag.sourceRect) delivered=\(deliveredFrames)"
+            "tick display=\(diag.displayID) frame=\(Int(framePixels.width))x\(Int(framePixels.height)) src=\(sourceRect) delivered=\(deliveredFrames) fps=\(String(format: "%.1f", streamFps))"
         )
     }
 }

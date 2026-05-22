@@ -27,13 +27,18 @@ public final class VideoAudioPlayer {
         let asset = AVAsset(url: url)
         let semaphore = DispatchSemaphore(value: 0)
         var loadedDuration: CMTime = .zero
+        var playbackAsset: AVAsset = asset
         Task {
             loadedDuration = (try? await asset.load(.duration)) ?? .zero
+            if let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first,
+               let composition = try? Self.audioOnlyComposition(from: audioTrack, duration: loadedDuration) {
+                playbackAsset = composition
+            }
             semaphore.signal()
         }
         semaphore.wait()
 
-        let item = AVPlayerItem(asset: asset)
+        let item = AVPlayerItem(asset: playbackAsset)
         item.audioTimePitchAlgorithm = .timeDomain
         let player = AVPlayer(playerItem: item)
         player.volume = max(0, min(1, volume))
@@ -45,7 +50,7 @@ public final class VideoAudioPlayer {
         self.isMuted = muted
 
         applyRate(sourceFps: sourceFps, outputFps: outputFps)
-        item.forwardPlaybackEndTime = rangeEndTime()
+        applyPlaybackLimits()
         installObservers()
         installTimeObserver()
         seekToRangeStart {
@@ -84,8 +89,7 @@ public final class VideoAudioPlayer {
 
     public func updateLoopRange(_ range: LoopRange) {
         loopRange = range.clamped()
-        player.currentItem?.forwardPlaybackEndTime = rangeEndTime()
-        installRangeEndObserver()
+        applyPlaybackLimits()
         seekToRangeStart { [weak self] in
             guard let self else { return }
             if self.isMuted {
@@ -171,6 +175,15 @@ public final class VideoAudioPlayer {
         }
     }
 
+    private func applyPlaybackLimits() {
+        if loop {
+            player.currentItem?.forwardPlaybackEndTime = .invalid
+        } else {
+            player.currentItem?.forwardPlaybackEndTime = rangeEndTime()
+        }
+        installRangeEndObserver()
+    }
+
     private func installTimeObserver() {
         let interval = CMTime(value: 1, timescale: 30)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
@@ -178,6 +191,13 @@ public final class VideoAudioPlayer {
             self.timeLock.lock()
             self.cachedPlaybackTime = time
             self.timeLock.unlock()
+            guard self.loop, !self.isLoopingSeek else { return }
+            let end = self.rangeEndTime()
+            let lead = CMTime(value: 1, timescale: 30)
+            let trigger = CMTimeSubtract(end, lead)
+            if CMTimeCompare(time, trigger) >= 0 {
+                self.handleReachedEnd()
+            }
         }
     }
 
@@ -203,8 +223,9 @@ public final class VideoAudioPlayer {
         removeRangeEndObserver()
         guard loop else { return }
         let end = rangeEndTime()
+        let trigger = CMTimeSubtract(end, CMTime(value: 1, timescale: 30))
         rangeEndObserver = player.addBoundaryTimeObserver(
-            forTimes: [NSValue(time: end)],
+            forTimes: [NSValue(time: trigger)],
             queue: .main
         ) { [weak self] in
             self?.handleReachedEnd()
@@ -228,6 +249,7 @@ public final class VideoAudioPlayer {
         seekToRangeStart { [weak self] in
             guard let self else { return }
             self.isLoopingSeek = false
+            self.applyPlaybackLimits()
             if self.isMuted {
                 self.player.pause()
             } else {
@@ -241,5 +263,18 @@ public final class VideoAudioPlayer {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
         removeRangeEndObserver()
+    }
+
+    private static func audioOnlyComposition(from audioTrack: AVAssetTrack, duration: CMTime) throws -> AVAsset {
+        let composition = AVMutableComposition()
+        guard let track = composition.addMutableTrack(
+            withMediaType: .audio,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+            throw NSError(domain: "VideoAudioPlayer", code: 1)
+        }
+        let range = CMTimeRange(start: .zero, duration: duration)
+        try track.insertTimeRange(range, of: audioTrack, at: .zero)
+        return composition
     }
 }

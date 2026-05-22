@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .library(name: "WledCore", targets: ["WledCore"]),
         .executable(name: "wledcast-swift", targets: ["WledCastApp"]),
+        .executable(name: "wledcast-ctl", targets: ["WledCastCtl"]),
     ],
     dependencies: [],
     targets: [
@@ -20,6 +21,11 @@ let package = Package(
             name: "WledCastApp",
             dependencies: ["WledCore"],
             path: "Sources/WledCastApp"
+        ),
+        .executableTarget(
+            name: "WledCastCtl",
+            dependencies: ["WledCore"],
+            path: "Sources/WledCastCtl"
         ),
         .testTarget(
             name: "WledCoreTests",

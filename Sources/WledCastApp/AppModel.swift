@@ -49,11 +49,14 @@ final class AppModel: ObservableObject {
     private var overlay: OverlayWindowController?
     private var boxRef: CaptureBoxRef?
     private var lastMosaicImage: CGImage?
+    private let mosaicPreviewGate = PreviewGate()
+    private let videoPreviewGate = PreviewGate()
     private var scrubGenerator: AVAssetImageGenerator?
     private var scrubAssetURL: URL?
     private var scrubAssetDuration: CMTime = .zero
     private var streamingSourceFps: Float = 30
     private var isLoopScrubbing = false
+    private var savedHostReachabilityChecked = false
 
     private let defaults = UserDefaults.standard
     private let videoSettingsStore = VideoSettingsStore()
@@ -70,8 +73,16 @@ final class AppModel: ObservableObject {
             refreshSelectedHostProfile()
         }
         Task { @MainActor [weak self] in
-            self?.autoStart()
+            guard let self else { return }
+            if !self.selectedHost.isEmpty {
+                await self.discovery.verify(host: self.selectedHost)
+            }
+            self.autoStart()
         }
+        AgentControlServer.shared.start { [weak self] request in
+            await self?.handleAgent(request) ?? .failure("app stopped")
+        }
+        syncPreviewGates()
     }
 
     var wledFpsLabel: String {
@@ -82,12 +93,8 @@ final class AppModel: ObservableObject {
     }
 
     private func autoStart() {
-        if !isOverlayVisible {
-            toggleOverlay()
-        }
-        if !isStreaming, canStartStreaming, isSelectedHostConnected {
-            startStreaming()
-        }
+        guard !isStreaming, canStartStreaming else { return }
+        startStreaming()
     }
 
     private var isOverlayVisible: Bool {
@@ -107,7 +114,38 @@ final class AppModel: ObservableObject {
     }
 
     private var isSelectedHostConnected: Bool {
-        hosts.contains { $0.host == selectedHost }
+        hosts.contains { $0.host.caseInsensitiveCompare(selectedHost) == .orderedSame }
+    }
+
+    private func reconcileSelectedHostIfNeeded(with discovered: [WLEDHost]) {
+        guard !selectedHost.isEmpty, !discovered.isEmpty else { return }
+        guard !isSelectedHostConnected else { return }
+        guard !savedHostReachabilityChecked else { return }
+        savedHostReachabilityChecked = true
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let saved = self.selectedHost
+            do {
+                let profile = try await self.discovery.fetchHostProfile(host: saved)
+                guard self.selectedHost == saved else { return }
+                await self.discovery.inject(host: saved, profile: profile)
+                self.applyHostProfile(profile, restartIfStreaming: false)
+                return
+            } catch {
+                Log.app.info("saved host \(saved) unreachable, reconciling with discovery")
+            }
+            guard self.selectedHost == saved,
+                  let replacement = self.replacementHost(for: discovered) else { return }
+            self.setHost(replacement.host)
+        }
+    }
+
+    private func replacementHost(for discovered: [WLEDHost]) -> WLEDHost? {
+        if discovered.count == 1 { return discovered[0] }
+        guard let resolution = outputResolution else { return nil }
+        let matches = discovered.filter { $0.resolution == resolution }
+        return matches.count == 1 ? matches[0] : nil
     }
 
     private func refreshSelectedHostProfile() {
@@ -145,8 +183,12 @@ final class AppModel: ObservableObject {
 
     private func applyEffectiveFps(_ value: Int) {
         let next = max(1, value)
-        guard fps != next else { return }
+        guard fps != next else {
+            syncPreviewGates()
+            return
+        }
         fps = next
+        syncPreviewGates()
         if isStreaming {
             restartStreaming()
             return
@@ -177,7 +219,8 @@ final class AppModel: ObservableObject {
     func setHost(_ host: String) {
         let hostChanged = host != selectedHost
         selectedHost = host
-        if let info = hosts.first(where: { $0.host == host }) {
+        savedHostReachabilityChecked = false
+        if let info = hosts.first(where: { $0.host.caseInsensitiveCompare(host) == .orderedSame }) {
             applyHostProfile(
                 WLEDHostProfile(resolution: info.resolution, targetFps: info.targetFps),
                 restartIfStreaming: hostChanged
@@ -229,6 +272,7 @@ final class AppModel: ObservableObject {
             overlay?.mosaicHolder.set(nil)
         }
         syncOverlayVisualizationSettings()
+        syncAgentSession()
         persist()
     }
 
@@ -407,14 +451,25 @@ final class AppModel: ObservableObject {
         return controller
     }
 
+    func hideOverlay() {
+        overlay?.hide()
+        stopVideoPreview()
+        syncOverlayVisualizationSettings()
+        syncAgentSession()
+    }
+
+    func showOverlay() {
+        ensureOverlayVisible()
+        refreshVideoPreviewIfNeeded()
+        syncOverlayVisualizationSettings()
+        syncAgentSession()
+    }
+
     func toggleOverlay() {
-        let controller = ensureOverlay()
-        if controller.window?.isVisible == true {
-            controller.hide()
-            stopVideoPreview()
+        if isOverlayVisible {
+            hideOverlay()
         } else {
-            controller.show()
-            refreshVideoPreviewIfNeeded()
+            showOverlay()
         }
     }
 
@@ -424,7 +479,6 @@ final class AppModel: ObservableObject {
         syncFpsFromSelectedHost()
         guard let resolution = outputResolution else { return }
         if captureMode == .region, !ensureScreenPermission() { return }
-        ensureOverlayVisible()
 
         do {
             let newSender = try DDPSender(host: selectedHost)
@@ -438,8 +492,13 @@ final class AppModel: ObservableObject {
                 filterConfig: filters,
                 flickerFighter: Float(flickerFighter)
             )
-            controller.onFrameProcessed = { [weak self] frame in
-                Task { @MainActor in self?.updatePreview(frame) }
+            controller.shouldProcessPreview = { [weak self] in
+                self?.mosaicPreviewGate.shouldEmit() ?? false
+            }
+            controller.onFrameProcessed = { [weak self] pixels, width, height in
+                Task { @MainActor in
+                    self?.updatePreview(RGBFrame(width: width, height: height, pixels: pixels))
+                }
             }
             session = controller
 
@@ -470,12 +529,18 @@ final class AppModel: ObservableObject {
                     }
                 )
                 videoSource.setPlaybackRate(playbackRate)
+                videoSource.shouldEmitPreview = { [weak self] in
+                    guard let self else { return false }
+                    return self.isOverlayVisible && self.videoPreviewGate.shouldEmit()
+                }
                 videoSource.onFrameBGRA = { [weak controller] buffer in
                     controller?.process(bgra: buffer)
                 }
                 videoSource.onPreviewBuffer = { [weak self] buffer in
+                    guard let self else { return }
+                    PerfLog.recordHudPreview()
                     Task { @MainActor in
-                        guard let self, !self.isLoopScrubbing else { return }
+                        guard !self.isLoopScrubbing else { return }
                         self.overlay?.setPreviewBuffer(buffer)
                     }
                 }
@@ -486,6 +551,28 @@ final class AppModel: ObservableObject {
                 stopVideoPreview()
                 startScreenCaptureStream(resolution: resolution, controller: controller)
             }
+            PerfLog.configure(
+                mode: captureMode == .region ? "region" : "video",
+                output: resolution,
+                fps: fps
+            )
+            var perfStart: [String: String] = [
+                "mode": captureMode == .region ? "region" : "video",
+                "output": "\(resolution.width)x\(resolution.height)",
+                "target_fps": "\(fps)",
+                "host": selectedHost,
+                "mosaic": overlayMosaicEnabled ? "1" : "0",
+                "overlay_visible": isOverlayVisible ? "1" : "0",
+                "perf_path": PerfLog.path.path,
+                "log_path": FileLog.shared.location.path,
+            ]
+            if captureMode == .region {
+                perfStart["capture_box"] = "\(captureBox.width)x\(captureBox.height)"
+                perfStart["capture_display"] = "\(captureBox.displayID)"
+            } else if let selectedVideo {
+                perfStart["video"] = selectedVideo.lastPathComponent
+            }
+            PerfLog.event("stream_start", perfStart)
             isStreaming = true
         } catch {
             senderState = .failed(error.localizedDescription)
@@ -517,6 +604,9 @@ final class AppModel: ObservableObject {
     }
 
     func stopStreaming() {
+        if isStreaming {
+            PerfLog.event("stream_stop")
+        }
         session?.blackout()
         source?.stop()
         source = nil
@@ -553,10 +643,16 @@ final class AppModel: ObservableObject {
                     } else if let selected = discovered.first(where: {
                         $0.host.caseInsensitiveCompare(self.selectedHost) == .orderedSame
                     }) {
+                        if self.selectedHost != selected.host {
+                            self.selectedHost = selected.host
+                            self.persist()
+                        }
                         self.applyHostProfile(
                             WLEDHostProfile(resolution: selected.resolution, targetFps: selected.targetFps),
                             restartIfStreaming: true
                         )
+                    } else {
+                        self.reconcileSelectedHostIfNeeded(with: discovered)
                     }
                 }
             }
@@ -596,6 +692,7 @@ final class AppModel: ObservableObject {
         if let resolution = outputResolution, let data = try? JSONEncoder().encode(resolution) {
             defaults.set(data, forKey: "outputResolution")
         }
+        defaults.set(targetFps, forKey: "targetFps")
         if let filterData = try? JSONEncoder().encode(filters) {
             defaults.set(filterData, forKey: "filters")
         }
@@ -617,6 +714,10 @@ final class AppModel: ObservableObject {
         if let resData = defaults.data(forKey: "outputResolution"),
            let decoded = try? JSONDecoder().decode(OutputResolution.self, from: resData) {
             outputResolution = decoded
+        }
+        if defaults.object(forKey: "targetFps") != nil {
+            targetFps = defaults.integer(forKey: "targetFps")
+            fps = targetFps > 0 ? targetFps : WLEDHost.defaultFps
         }
         if let filterData = defaults.data(forKey: "filters"),
            let decodedFilters = try? JSONDecoder().decode(FilterConfig.self, from: filterData) {
@@ -722,14 +823,90 @@ final class AppModel: ObservableObject {
         return items.contains { $0.pathExtension.lowercased() == "mp4" }
     }
 
+    private func syncOverlayVisualizationSettings() {
+        overlay?.mosaicEnabled = overlayMosaicEnabled
+        mosaicPreviewGate.isEnabled = overlayMosaicEnabled && isOverlayVisible
+        videoPreviewGate.isEnabled = isOverlayVisible
+    }
+
+    private func syncPreviewGates() {
+        let interval = 1.0 / Double(max(1, fps))
+        mosaicPreviewGate.setInterval(interval)
+        videoPreviewGate.setInterval(interval)
+    }
+
+    private func syncAgentSession() {
+        PerfLog.syncSession(agentSessionFields())
+    }
+
+    private func agentSessionFields() -> [String: String] {
+        var fields: [String: String] = [
+            "mode": captureMode == .region ? "region" : "video",
+            "target_fps": "\(fps)",
+            "host": selectedHost,
+            "mosaic": overlayMosaicEnabled ? "1" : "0",
+            "overlay_visible": isOverlayVisible ? "1" : "0",
+        ]
+        if let resolution = outputResolution {
+            fields["output"] = "\(resolution.width)x\(resolution.height)"
+        }
+        if captureMode == .region {
+            fields["capture_box"] = "\(captureBox.width)x\(captureBox.height)"
+        } else if let selectedVideo {
+            fields["video"] = selectedVideo.lastPathComponent
+        }
+        return fields
+    }
+
+    func handleAgent(_ request: AgentControlRequest) -> AgentControlResponse {
+        switch request.cmd {
+        case "status":
+            return .success(agentStatus())
+        case "overlay.show":
+            showOverlay()
+            return .success(agentStatus())
+        case "overlay.hide":
+            hideOverlay()
+            return .success(agentStatus())
+        case "mosaic.on":
+            setOverlayMosaicEnabled(true)
+            return .success(agentStatus())
+        case "mosaic.off":
+            setOverlayMosaicEnabled(false)
+            return .success(agentStatus())
+        case "stream.start":
+            guard canStartStreaming else { return .failure("cannot start stream") }
+            if !isStreaming { startStreaming() }
+            return .success(agentStatus())
+        case "stream.stop":
+            if isStreaming { stopStreaming() }
+            return .success(agentStatus())
+        case "fps.set":
+            guard let value = request.value, value > 0 else { return .failure("missing fps value") }
+            targetFps = value
+            applyEffectiveFps(value)
+            persist()
+            if !isStreaming { syncAgentSession() }
+            return .success(agentStatus())
+        default:
+            return .failure("unknown cmd: \(request.cmd)")
+        }
+    }
+
+    private func agentStatus() -> [String: String] {
+        var status = agentSessionFields()
+        status["streaming"] = isStreaming ? "1" : "0"
+        status["sender"] = "\(senderState)"
+        status["control_socket"] = LogPaths.controlSocket.path
+        status["agent_json"] = LogPaths.agentSnapshot.path
+        return status
+    }
+
     private func updatePreview(_ frame: RGBFrame) {
+        guard overlayMosaicEnabled, isOverlayVisible else { return }
         guard let image = makePreviewCGImage(frame) else { return }
         lastMosaicImage = image
         overlay?.mosaicHolder.set(image)
-    }
-
-    private func syncOverlayVisualizationSettings() {
-        overlay?.mosaicEnabled = overlayMosaicEnabled
     }
 
     private func startAudioPlayer(url: URL, outputFps: Int, sourceFps: Float) {
@@ -787,9 +964,15 @@ final class AppModel: ObservableObject {
                 decodeTarget: outputResolution
             )
             preview.setPlaybackRate(playbackRate)
+            preview.shouldEmitPreview = { [weak self] in
+                guard let self else { return false }
+                return self.isOverlayVisible && self.videoPreviewGate.shouldEmit()
+            }
             preview.onPreviewBuffer = { [weak self] buffer in
+                guard let self else { return }
+                PerfLog.recordHudPreview()
                 Task { @MainActor in
-                    guard let self, !self.isLoopScrubbing else { return }
+                    guard !self.isLoopScrubbing else { return }
                     self.overlay?.setPreviewBuffer(buffer)
                 }
             }
@@ -886,5 +1069,28 @@ final class AppModel: ObservableObject {
             shouldInterpolate: false,
             intent: .defaultIntent
         )
+    }
+}
+
+private final class PreviewGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var interval: CFAbsoluteTime = 1.0 / 28.0
+    private var lastAt: CFAbsoluteTime = 0
+    var isEnabled = true
+
+    func setInterval(_ value: CFAbsoluteTime) {
+        lock.lock()
+        interval = max(1.0 / 120.0, value)
+        lock.unlock()
+    }
+
+    func shouldEmit() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard isEnabled else { return false }
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastAt >= interval else { return false }
+        lastAt = now
+        return true
     }
 }

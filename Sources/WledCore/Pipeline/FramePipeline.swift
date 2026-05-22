@@ -31,14 +31,26 @@ public final class FramePipeline {
     }
 
     public func process(bgra source: vImage_Buffer, filters: FilterConfig) -> RGBFrame {
+        var pixels = [UInt8]()
+        process(bgra: source, filters: filters, rgbOut: &pixels)
+        return RGBFrame(width: outputWidth, height: outputHeight, pixels: pixels)
+    }
+
+    public func process(bgra source: vImage_Buffer, filters: FilterConfig, rgbOut: inout [UInt8]) {
         scale(source: source)
         swizzleToRGB()
         applyColorFilters(filters)
         if filters.sharpen != 0 {
             applySharpen(alpha: filters.sharpen)
         }
-        let pixels = [UInt8](UnsafeBufferPointer(start: rgbBuffer, count: pixelCount * 3))
-        return RGBFrame(width: outputWidth, height: outputHeight, pixels: pixels)
+        let byteCount = pixelCount * 3
+        if rgbOut.count != byteCount {
+            rgbOut = [UInt8](repeating: 0, count: byteCount)
+        }
+        rgbOut.withUnsafeMutableBytes { dst in
+            guard let dstBase = dst.baseAddress else { return }
+            memcpy(dstBase, rgbBuffer, byteCount)
+        }
     }
 
     private func scale(source: vImage_Buffer) {
@@ -53,7 +65,7 @@ public final class FramePipeline {
         let ratioY = Double(src.height) / Double(outputHeight)
         let ratio = max(ratioX, ratioY)
         var flags = vImage_Flags(kvImageEdgeExtend) | vImage_Flags(kvImageDoNotTile)
-        if ratio < 8 {
+        if ratio > 2 {
             flags |= vImage_Flags(kvImageHighQualityResampling)
         }
         vImageScale_ARGB8888(&src, &dst, nil, flags)
@@ -88,19 +100,19 @@ public final class FramePipeline {
         let satBG = oneMinusS * 0.587
         let satBB = s + oneMinusS * 0.114
 
-        var sumR: Float = 0
-        var sumG: Float = 0
-        var sumB: Float = 0
+        var sumR: UInt64 = 0
+        var sumG: UInt64 = 0
+        var sumB: UInt64 = 0
         for i in 0..<pixelCount {
-            let p = rgbBuffer.advanced(by: i * 3)
-            sumR += Float(p[0])
-            sumG += Float(p[1])
-            sumB += Float(p[2])
+            let p = i * 3
+            sumR += UInt64(rgbBuffer[p])
+            sumG += UInt64(rgbBuffer[p + 1])
+            sumB += UInt64(rgbBuffer[p + 2])
         }
         let invN = 1 / Float(pixelCount)
-        let meanR = sumR * invN
-        let meanG = sumG * invN
-        let meanB = sumB * invN
+        let meanR = Float(sumR) * invN
+        let meanG = Float(sumG) * invN
+        let meanB = Float(sumB) * invN
         let satMeanR = satRR * meanR + satRG * meanG + satRB * meanB
         let satMeanG = satGR * meanR + satGG * meanG + satGB * meanB
         let satMeanB = satBR * meanR + satBG * meanG + satBB * meanB
@@ -126,13 +138,13 @@ public final class FramePipeline {
         let biasB = postB * oneMinusC * satMeanB
 
         for i in 0..<pixelCount {
-            let p = rgbBuffer.advanced(by: i * 3)
-            let r = Float(p[0])
-            let g = Float(p[1])
-            let b = Float(p[2])
-            p[0] = clip(aRR * r + aRG * g + aRB * b + biasR)
-            p[1] = clip(aGR * r + aGG * g + aGB * b + biasG)
-            p[2] = clip(aBR * r + aBG * g + aBB * b + biasB)
+            let p = i * 3
+            let r = Float(rgbBuffer[p])
+            let g = Float(rgbBuffer[p + 1])
+            let b = Float(rgbBuffer[p + 2])
+            rgbBuffer[p] = clip(aRR * r + aRG * g + aRB * b + biasR)
+            rgbBuffer[p + 1] = clip(aGR * r + aGG * g + aGB * b + biasG)
+            rgbBuffer[p + 2] = clip(aBR * r + aBG * g + aBB * b + biasB)
         }
     }
 

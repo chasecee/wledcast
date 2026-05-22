@@ -32,7 +32,11 @@ public final class DDPSender: @unchecked Sendable {
     }
 
     public func send(frame: RGBFrame) {
-        sendRaw(frame.flattenedData())
+        send(pixels: frame.pixels)
+    }
+
+    public func send(pixels: [UInt8]) {
+        sendRaw(Data(pixels))
     }
 
     public func sendRaw(_ payload: Data) {

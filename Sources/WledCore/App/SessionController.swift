@@ -9,8 +9,10 @@ public final class SessionController: @unchecked Sendable {
     private let filterLock = NSLock()
     private var filterConfig: FilterConfig
     private var flickerFighter: Float
+    private var workPixels: [UInt8] = []
 
-    public var onFrameProcessed: ((RGBFrame) -> Void)?
+    public var onFrameProcessed: (([UInt8], Int, Int) -> Void)?
+    public var shouldProcessPreview: (() -> Bool)?
 
     public init(
         sender: DDPSender,
@@ -38,10 +40,30 @@ public final class SessionController: @unchecked Sendable {
         let cfg = filterConfig
         let flicker = flickerFighter
         filterLock.unlock()
-        let processed = pipeline.process(bgra: bgra, filters: cfg)
-        let smoothed = temporalSmoother.apply(frame: processed, strength: flicker)
-        onFrameProcessed?(smoothed)
-        sender.send(frame: smoothed)
+        let preview = shouldProcessPreview?() == true
+        let t0 = CFAbsoluteTimeGetCurrent()
+        pipeline.process(bgra: bgra, filters: cfg, rgbOut: &workPixels)
+        temporalSmoother.apply(
+            pixels: &workPixels,
+            width: outputResolution.width,
+            height: outputResolution.height,
+            strength: flicker
+        )
+        let processMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        PerfLog.recordFrame(
+            sourceWidth: Int(bgra.width),
+            sourceHeight: Int(bgra.height),
+            processMs: processMs,
+            preview: preview
+        )
+        if preview, let onFrameProcessed {
+            onFrameProcessed(
+                workPixels,
+                outputResolution.width,
+                outputResolution.height
+            )
+        }
+        sender.send(pixels: workPixels)
     }
 
     public func blackout() {

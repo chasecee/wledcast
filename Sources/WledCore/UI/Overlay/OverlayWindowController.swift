@@ -188,9 +188,18 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
     }
 
     private func createCGImage(from pixelBuffer: CVPixelBuffer) -> CGImage? {
-        var image: CGImage?
-        VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &image)
-        return image
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let maxEdge = max(width, height)
+        if maxEdge <= 320 {
+            var image: CGImage?
+            VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &image)
+            return image
+        }
+        let scale = 320.0 / Double(maxEdge)
+        let image = CIImage(cvPixelBuffer: pixelBuffer)
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        return ciContext.createCGImage(image, from: image.extent)
     }
 
     public func show() {

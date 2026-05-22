@@ -10,16 +10,7 @@ public final class FileLog: @unchecked Sendable {
     private let formatter: ISO8601DateFormatter
 
     private init() {
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-        let candidate = cwd.appendingPathComponent("wledcast.log")
-        if FileManager.default.isWritableFile(atPath: cwd.path) || FileManager.default.fileExists(atPath: candidate.path) {
-            self.url = candidate
-        } else {
-            let fallback = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
-                .appendingPathComponent("Logs/WledCast", isDirectory: true)
-            try? FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)
-            self.url = fallback.appendingPathComponent("wledcast.log")
-        }
+        self.url = LogPaths.fileLog
         self.formatter = ISO8601DateFormatter()
         self.formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     }
@@ -43,9 +34,7 @@ public final class FileLog: @unchecked Sendable {
             if newSize > maxBytes {
                 try trim(handle: handle, currentSize: newSize)
             }
-        } catch {
-            // ignore: never let logging affect runtime
-        }
+        } catch {}
     }
 
     private func trim(handle: FileHandle, currentSize: UInt64) throws {
