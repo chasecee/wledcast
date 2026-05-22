@@ -94,8 +94,53 @@ public struct AppOptions: Equatable, Sendable {
 
 public enum CaptureMode: String, Codable, CaseIterable, Sendable {
     case region
-    case display
-    case window
+    case video
+}
+
+public struct VideoCropBox: Codable, Equatable, Sendable {
+    public var x: Double
+    public var y: Double
+    public var width: Double
+    public var height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+
+    public static let full = VideoCropBox(x: 0, y: 0, width: 1, height: 1)
+}
+
+public struct LoopRange: Codable, Equatable, Sendable {
+    public var start: Double
+    public var end: Double
+
+    public init(start: Double, end: Double) {
+        self.start = start
+        self.end = end
+    }
+
+    public static let full = LoopRange(start: 0, end: 1)
+
+    public static let minSpan: Double = 0.01
+
+    public func clamped() -> LoopRange {
+        let s = min(max(0, start), 1 - LoopRange.minSpan)
+        let e = max(min(1, end), s + LoopRange.minSpan)
+        return LoopRange(start: s, end: e)
+    }
+}
+
+public struct VideoWindowSize: Codable, Equatable, Sendable {
+    public var width: Double
+    public var height: Double
+
+    public init(width: Double, height: Double) {
+        self.width = width
+        self.height = height
+    }
 }
 
 public struct CaptureSelection: Codable, Equatable, Sendable {

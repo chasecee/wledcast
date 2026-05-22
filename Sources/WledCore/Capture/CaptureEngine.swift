@@ -81,7 +81,7 @@ public final class DisplayFrameSource {
         guard box.displayID == activeDisplayID else { return }
         guard let stream, let configuration = streamConfiguration else { return }
         configuration.sourceRect = sourceRect(for: box)
-        let captureSize = captureSize(for: .region, displayID: activeDisplayID, box: box, windowSizePoints: nil)
+        let captureSize = captureSize(for: .region, displayID: activeDisplayID, box: box)
         configuration.width = captureSize.width
         configuration.height = captureSize.height
         Task {
@@ -100,12 +100,11 @@ public final class DisplayFrameSource {
 
     private func startStream() async throws {
         let content = try await SCShareableContent.current
-        let (filter, displayID, windowSizePoints) = try buildFilter(content: content)
+        let (filter, displayID) = try buildFilter(content: content)
         let captureSize = captureSize(
             for: captureSelection.mode,
             displayID: displayID,
-            box: boxRef.box,
-            windowSizePoints: windowSizePoints
+            box: boxRef.box
         )
 
         let configuration = SCStreamConfiguration()
@@ -132,18 +131,11 @@ public final class DisplayFrameSource {
         streamConfiguration = configuration
     }
 
-    private func buildFilter(content: SCShareableContent) throws -> (SCContentFilter, CGDirectDisplayID, CGSize?) {
+    private func buildFilter(content: SCShareableContent) throws -> (SCContentFilter, CGDirectDisplayID) {
         switch captureSelection.mode {
-        case .window:
-            guard
-                let windowID = captureSelection.windowID,
-                let window = content.windows.first(where: { $0.windowID == windowID })
-            else {
-                throw NSError(domain: "DisplayFrameSource", code: 2)
-            }
-            let fallbackDisplayID = content.displays.first?.displayID ?? CGMainDisplayID()
-            return (SCContentFilter(desktopIndependentWindow: window), fallbackDisplayID, window.frame.size)
-        case .display, .region:
+        case .video:
+            throw NSError(domain: "DisplayFrameSource", code: 7)
+        case .region:
             let display: SCDisplay?
             if let displayID = captureSelection.displayID {
                 display = content.displays.first(where: { $0.displayID == displayID })
@@ -155,48 +147,24 @@ public final class DisplayFrameSource {
                 throw NSError(domain: "DisplayFrameSource", code: 3)
             }
             let excluded = content.windows.filter { excludedWindowIDs.contains($0.windowID) }
-            return (SCContentFilter(display: display, excludingWindows: excluded), display.displayID, nil)
+            return (SCContentFilter(display: display, excludingWindows: excluded), display.displayID)
         }
     }
 
     private func captureSize(
         for mode: CaptureMode,
         displayID: CGDirectDisplayID,
-        box: CaptureBox,
-        windowSizePoints: CGSize?
+        box: CaptureBox
     ) -> (width: Int, height: Int) {
         switch mode {
+        case .video:
+            return clampCaptureSize(width: outputResolution.width, height: outputResolution.height)
         case .region:
             let scale = backingScale(for: displayID)
             return clampCaptureSize(
                 width: Int((CGFloat(max(1, box.width)) * scale).rounded()),
                 height: Int((CGFloat(max(1, box.height)) * scale).rounded())
             )
-        case .display:
-            if let screen = NSScreen.screen(for: displayID) {
-                let scale = screen.backingScaleFactor
-                return clampCaptureSize(
-                    width: Int((screen.frame.width * scale).rounded()),
-                    height: Int((screen.frame.height * scale).rounded())
-                )
-            }
-            return clampCaptureSize(width: outputResolution.width, height: outputResolution.height)
-        case .window:
-            if let windowSizePoints {
-                let scale = backingScale(for: displayID)
-                return clampCaptureSize(
-                    width: Int((max(1, windowSizePoints.width) * scale).rounded()),
-                    height: Int((max(1, windowSizePoints.height) * scale).rounded())
-                )
-            }
-            if let screen = NSScreen.screen(for: displayID) {
-                let scale = screen.backingScaleFactor
-                return clampCaptureSize(
-                    width: Int((screen.frame.width * scale).rounded()),
-                    height: Int((screen.frame.height * scale).rounded())
-                )
-            }
-            return clampCaptureSize(width: outputResolution.width, height: outputResolution.height)
         }
     }
 

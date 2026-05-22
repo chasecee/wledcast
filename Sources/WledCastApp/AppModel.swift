@@ -1,8 +1,11 @@
 import ApplicationServices
 import AppKit
+import AVFoundation
 import Combine
 import CoreGraphics
+import CoreMedia
 import Foundation
+import SwiftUI
 import WledCore
 
 @MainActor
@@ -14,28 +17,39 @@ final class AppModel: ObservableObject {
     @Published var flickerFighter: Double = 0
     @Published var captureBox: CaptureBox = .centered(on: NSScreen.main ?? NSScreen.screens.first!)
     @Published var captureMode: CaptureMode = .region
+    @Published var videoLibrary: [URL] = []
+    @Published var selectedVideo: URL?
+    @Published var videoCropBox: VideoCropBox = .full
+    @Published var videoWindowSize = CGSize(width: 640, height: 360)
+    @Published var loopVideo = true
+    @Published var loopRange: LoopRange = .full
+    @Published var overlayMosaicEnabled = true
     @Published var fps: Int = 30
     @Published var aspectLock = true
     @Published var isStreaming = false
     @Published var senderState: DDPSenderState = .stopped
-    @Published var txPreviewImage: NSImage?
-    @Published var txPreviewInfo: String = "No frames yet"
-    @Published var captureDiagnostics: String = ""
 
     private let discovery = WLEDDiscoveryClient()
     private var discoveryTask: Task<Void, Never>?
     private var session: SessionController?
     private var sender: DDPSender?
     private var source: DisplayFrameSource?
+    private var videoSource: VideoFrameSource?
+    private var videoPreviewSource: VideoFrameSource?
     private var pacer: FramePacer?
     private var overlay: OverlayWindowController?
     private var boxRef: CaptureBoxRef?
-    private var lastPreviewUpdate = Date.distantPast
+    private var lastMosaicImage: NSImage?
+    private var scrubGenerator: AVAssetImageGenerator?
+    private var scrubAssetURL: URL?
+    private var scrubAssetDuration: CMTime = .zero
+    private var isScrubbing = false
 
     private let defaults = UserDefaults.standard
 
     init() {
         restore()
+        refreshVideoLibrary()
         startDiscovery()
         if !selectedHost.isEmpty {
             refreshSelectedHostResolution()
@@ -46,12 +60,28 @@ final class AppModel: ObservableObject {
     }
 
     private func autoStart() {
-        if overlay?.window?.isVisible != true {
+        if !isOverlayVisible {
             toggleOverlay()
         }
-        if !isStreaming, !selectedHost.isEmpty, outputResolution != nil {
+        if !isStreaming, canStartStreaming, isSelectedHostConnected {
             startStreaming()
         }
+    }
+
+    private var isOverlayVisible: Bool {
+        overlay?.window?.isVisible == true
+    }
+
+    private var canStartStreaming: Bool {
+        guard !selectedHost.isEmpty, outputResolution != nil else { return false }
+        if captureMode == .video {
+            return selectedVideo != nil
+        }
+        return true
+    }
+
+    private var isSelectedHostConnected: Bool {
+        hosts.contains { $0.host == selectedHost }
     }
 
     private func refreshSelectedHostResolution() {
@@ -61,9 +91,9 @@ final class AppModel: ObservableObject {
             do {
                 let resolution = try await self.discovery.fetchMatrixResolution(host: host)
                 guard self.selectedHost == host else { return }
+                await self.discovery.inject(host: host, resolution: resolution)
                 let previous = self.outputResolution
                 if previous != resolution {
-                    Log.app.notice("resolution updated for \(host): \(resolution.width)x\(resolution.height)")
                     self.outputResolution = resolution
                     self.overlay?.outputResolution = resolution
                     self.persist()
@@ -105,14 +135,33 @@ final class AppModel: ObservableObject {
     }
 
     func setCaptureMode(_ mode: CaptureMode) {
+        guard captureMode != mode else { return }
         captureMode = mode
+        if mode == .video {
+            refreshVideoLibrary()
+            if selectedVideo == nil {
+                selectedVideo = videoLibrary.first
+            }
+        }
+        let overlay = ensureOverlay()
+        overlay.setMode(mode)
+        syncOverlayVisualizationSettings()
+        refreshVideoPreviewIfNeeded()
         persist()
+        if isStreaming {
+            restartStreaming()
+        } else {
+            autoStart()
+        }
     }
 
     func setFPS(_ value: Int) {
         fps = max(1, value)
         persist()
-        if isStreaming {
+        if captureMode == .video {
+            videoSource?.setOutputFps(fps)
+            videoPreviewSource?.setOutputFps(fps)
+        } else if isStreaming {
             restartStreaming()
         }
     }
@@ -121,6 +170,51 @@ final class AppModel: ObservableObject {
         aspectLock = value
         overlay?.aspectLock = value
         persist()
+    }
+
+    func setOverlayMosaicEnabled(_ value: Bool) {
+        overlayMosaicEnabled = value
+        if value, let lastMosaicImage {
+            overlay?.mosaicImage = lastMosaicImage
+        }
+        syncOverlayVisualizationSettings()
+        persist()
+    }
+
+    func setSelectedVideo(_ url: URL?) {
+        selectedVideo = url
+        scrubGenerator = nil
+        scrubAssetURL = nil
+        scrubAssetDuration = .zero
+        loopRange = .full
+        persist()
+        refreshVideoPreviewIfNeeded()
+        if isStreaming, captureMode == .video {
+            restartStreaming()
+        }
+    }
+
+    func setLoopVideo(_ value: Bool) {
+        loopVideo = value
+        persist()
+        refreshVideoPreviewIfNeeded()
+        if isStreaming, captureMode == .video {
+            restartStreaming()
+        }
+    }
+
+    func refreshVideoLibrary() {
+        let directory = resolvedVideoDirectoryURL()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let items = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        videoLibrary = items
+            .filter { $0.pathExtension.lowercased() == "mp4" }
+            .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+        if let selectedVideo, !videoLibrary.contains(selectedVideo) {
+            self.selectedVideo = videoLibrary.first
+        } else if self.selectedVideo == nil {
+            self.selectedVideo = videoLibrary.first
+        }
     }
 
     func setFilters(_ value: FilterConfig) {
@@ -136,69 +230,160 @@ final class AppModel: ObservableObject {
     }
 
     private func ensureOverlayVisible() {
-        if overlay == nil {
-            toggleOverlay()
-            return
-        }
-        if overlay?.window?.isVisible != true {
-            overlay?.show()
+        let controller = ensureOverlay()
+        if controller.window?.isVisible != true {
+            controller.show()
         }
     }
 
-    func toggleOverlay() {
-        if overlay == nil {
-            let controller = OverlayWindowController(captureBox: captureBox)
+    private func ensureOverlay() -> OverlayWindowController {
+        if let overlay {
+            overlay.setMode(captureMode)
+            overlay.setVideoCrop(videoCropBox)
             if let resolution = outputResolution {
-                controller.outputResolution = resolution
+                overlay.outputResolution = resolution
             }
-            controller.aspectLock = aspectLock
-            controller.onChange = { [weak self] box in
-                Task { @MainActor in
-                    guard let self else { return }
-                    let displayChanged = self.captureBox.displayID != box.displayID
-                    self.captureBox = box
-                    self.boxRef?.update(box)
+            overlay.aspectLock = aspectLock
+            overlay.setMinimumSettingsWidth(360)
+            syncOverlayVisualizationSettings()
+            return overlay
+        }
+
+        let controller = OverlayWindowController(captureBox: captureBox)
+        controller.setMode(captureMode)
+        controller.setVideoCrop(videoCropBox)
+        if let resolution = outputResolution {
+            controller.outputResolution = resolution
+        }
+        controller.aspectLock = aspectLock
+        controller.setMinimumSettingsWidth(360)
+        controller.setSettingsContent(
+            AnyView(
+                SettingsPaneView(
+                    onHeightChange: { [weak self] height in
+                        self?.overlay?.setSettingsHeight(height)
+                    },
+                    minWidth: 360
+                )
+                .environmentObject(self)
+            )
+        )
+        controller.onTopRegionSizeChange = { [weak self] size in
+            Task { @MainActor in
+                guard let self else { return }
+                if self.captureMode == .video {
+                    self.videoWindowSize = size
                     self.persist()
-                    guard self.isStreaming else { return }
-                    if displayChanged {
-                        self.restartStreaming()
-                    } else {
-                        self.source?.updateRegion(box: box)
-                    }
                 }
             }
-            overlay = controller
         }
-        if overlay?.window?.isVisible == true {
-            overlay?.hide()
+        controller.onChange = { [weak self] box in
+            Task { @MainActor in
+                guard let self else { return }
+                let displayChanged = self.captureBox.displayID != box.displayID
+                self.captureBox = box
+                self.boxRef?.update(box)
+                self.persist()
+                guard self.isStreaming, self.captureMode == .region else { return }
+                if displayChanged {
+                    self.restartStreaming()
+                } else {
+                    self.source?.updateRegion(box: box)
+                }
+            }
+        }
+        controller.onVideoCropChange = { [weak self] crop in
+            Task { @MainActor in
+                guard let self else { return }
+                self.videoCropBox = crop
+                self.videoSource?.updateCrop(crop)
+                self.videoPreviewSource?.updateCrop(crop)
+                self.persist()
+            }
+        }
+        overlay = controller
+        syncOverlayVisualizationSettings()
+        return controller
+    }
+
+    func toggleOverlay() {
+        let controller = ensureOverlay()
+        if controller.window?.isVisible == true {
+            controller.hide()
+            stopVideoPreview()
         } else {
-            overlay?.show()
+            controller.show()
+            refreshVideoPreviewIfNeeded()
         }
     }
 
     func startStreaming() {
-        if isStreaming {
-            return
-        }
-        guard ensureScreenPermission() else {
-            return
-        }
-        guard !selectedHost.isEmpty else {
-            return
-        }
-        guard let resolution = outputResolution else {
-            Log.app.warning("startStreaming aborted: no matrix resolution yet for \(selectedHost)")
-            return
-        }
+        guard !isStreaming else { return }
+        guard !selectedHost.isEmpty else { return }
+        guard let resolution = outputResolution else { return }
+        if captureMode == .region, !ensureScreenPermission() { return }
+        ensureOverlayVisible()
 
-        if overlay == nil || overlay?.window?.isVisible != true {
-            ensureOverlayVisible()
-        }
+        do {
+            let newSender = try DDPSender(host: selectedHost)
+            newSender.onStateChanged = { [weak self] state in
+                Task { @MainActor in self?.senderState = state }
+            }
+            sender = newSender
+            let controller = SessionController(
+                sender: newSender,
+                outputResolution: resolution,
+                filterConfig: filters,
+                flickerFighter: Float(flickerFighter)
+            )
+            controller.onFrameProcessed = { [weak self] frame in
+                Task { @MainActor in self?.updatePreview(frame) }
+            }
+            session = controller
 
-        let selection = CaptureSelection(
-            mode: captureMode,
-            displayID: captureMode == .region ? captureBox.displayID : nil
-        )
+            switch captureMode {
+            case .video:
+                guard let selectedVideo else {
+                    senderState = .failed("No video selected")
+                    sender?.stop()
+                    sender = nil
+                    session?.stop()
+                    session = nil
+                    refreshVideoPreviewIfNeeded()
+                    return
+                }
+                let videoSource = try VideoFrameSource(
+                    url: selectedVideo,
+                    fps: fps,
+                    crop: videoCropBox,
+                    loop: loopVideo,
+                    loopRange: loopRange
+                )
+                videoSource.onFrame = { [weak controller] frame in
+                    controller?.process(frame: frame)
+                }
+                videoSource.onPreviewBuffer = { [weak self] buffer in
+                    Task { @MainActor in
+                        self?.overlay?.setPreviewBuffer(buffer)
+                    }
+                }
+                stopVideoPreview()
+                self.videoSource = videoSource
+                source = nil
+                pacer = nil
+            case .region:
+                stopVideoPreview()
+                startScreenCaptureStream(resolution: resolution, controller: controller)
+            }
+            isStreaming = true
+        } catch {
+            senderState = .failed(error.localizedDescription)
+            refreshVideoPreviewIfNeeded()
+        }
+    }
+
+    private func startScreenCaptureStream(resolution: OutputResolution, controller: SessionController) {
+        let selection = CaptureSelection(mode: .region, displayID: captureBox.displayID)
         let ref = CaptureBoxRef(captureBox)
         boxRef = ref
         let excludedWindows = [overlay?.captureWindowID].compactMap { $0 }
@@ -209,45 +394,16 @@ final class AppModel: ObservableObject {
             captureSelection: selection,
             excludedWindowIDs: excludedWindows
         )
-        frameSource.onDiagnostics = { [weak self] diag in
-            Task { @MainActor in
-                self?.captureDiagnostics = format(diagnostics: diag)
-            }
-        }
         source = frameSource
-        do {
-            let newSender = try DDPSender(host: selectedHost)
-            newSender.onStateChanged = { [weak self] state in
-                Task { @MainActor in
-                    self?.senderState = state
-                }
-            }
-            sender = newSender
-            let controller = SessionController(
-                sender: newSender,
-                outputResolution: resolution,
-                filterConfig: filters,
-                flickerFighter: Float(flickerFighter)
-            )
-            controller.onFrameProcessed = { [weak self] frame in
-                Task { @MainActor in
-                    self?.updatePreview(frame)
-                }
-            }
-            let newPacer = FramePacer()
-            newPacer.onTick = { [weak controller] frame in
-                controller?.process(frame: frame)
-            }
-            frameSource.onFrame = { [weak newPacer] frame in
-                newPacer?.ingest(frame)
-            }
-            newPacer.start(fps: fps)
-            pacer = newPacer
-            session = controller
-            isStreaming = true
-        } catch {
-            senderState = .failed(error.localizedDescription)
+        let newPacer = FramePacer()
+        newPacer.onTick = { [weak controller] frame in
+            controller?.process(frame: frame)
         }
+        frameSource.onFrame = { [weak newPacer] frame in
+            newPacer?.ingest(frame)
+        }
+        newPacer.start(fps: fps)
+        pacer = newPacer
     }
 
     private func restartStreaming() {
@@ -259,16 +415,18 @@ final class AppModel: ObservableObject {
         session?.blackout()
         source?.stop()
         source = nil
+        videoSource?.stop()
+        videoSource = nil
         pacer?.stop()
         pacer = nil
+        boxRef = nil
         session?.stop()
         session = nil
         sender?.stop()
         sender = nil
         isStreaming = false
-        txPreviewInfo = "No frames yet"
-        txPreviewImage = nil
-        captureDiagnostics = ""
+        overlay?.mosaicImage = nil
+        refreshVideoPreviewIfNeeded()
     }
 
     private func startDiscovery() {
@@ -327,6 +485,14 @@ final class AppModel: ObservableObject {
         defaults.set(fps, forKey: "fps")
         defaults.set(aspectLock, forKey: "aspectLock")
         defaults.set(captureMode.rawValue, forKey: "captureMode")
+        defaults.set(selectedVideo?.path, forKey: "selectedVideoPath")
+        defaults.set(loopVideo, forKey: "loopVideo")
+        defaults.set(overlayMosaicEnabled, forKey: "overlayMosaicEnabled")
+        defaults.set(videoWindowSize.width, forKey: "videoWindowWidth")
+        defaults.set(videoWindowSize.height, forKey: "videoWindowHeight")
+        if let loopData = try? JSONEncoder().encode(loopRange) {
+            defaults.set(loopData, forKey: "loopRange")
+        }
         if let resolution = outputResolution, let data = try? JSONEncoder().encode(resolution) {
             defaults.set(data, forKey: "outputResolution")
         }
@@ -337,52 +503,197 @@ final class AppModel: ObservableObject {
         if let boxData = try? JSONEncoder().encode(captureBox) {
             defaults.set(boxData, forKey: "captureBox")
         }
+        if let cropData = try? JSONEncoder().encode(videoCropBox) {
+            defaults.set(cropData, forKey: "videoCropBox")
+        }
+        defaults.removeObject(forKey: "dockedPanelWidth")
+        defaults.removeObject(forKey: "dockedPanelVisible")
     }
 
     private func restore() {
         selectedHost = defaults.string(forKey: "lastHost") ?? ""
         fps = max(1, defaults.integer(forKey: "fps"))
-        if fps == 0 {
-            fps = 30
-        }
+        if fps == 0 { fps = 30 }
         aspectLock = defaults.object(forKey: "aspectLock") as? Bool ?? true
-        if let modeRaw = defaults.string(forKey: "captureMode"), let mode = CaptureMode(rawValue: modeRaw) {
+        if let modeRaw = defaults.string(forKey: "captureMode"),
+           let mode = CaptureMode(rawValue: modeRaw) {
             captureMode = mode
+        } else {
+            captureMode = .region
         }
-        if
-            let resData = defaults.data(forKey: "outputResolution"),
-            let decoded = try? JSONDecoder().decode(OutputResolution.self, from: resData)
-        {
+        if let resData = defaults.data(forKey: "outputResolution"),
+           let decoded = try? JSONDecoder().decode(OutputResolution.self, from: resData) {
             outputResolution = decoded
         }
-        if
-            let filterData = defaults.data(forKey: "filters"),
-            let decodedFilters = try? JSONDecoder().decode(FilterConfig.self, from: filterData)
-        {
+        if let filterData = defaults.data(forKey: "filters"),
+           let decodedFilters = try? JSONDecoder().decode(FilterConfig.self, from: filterData) {
             filters = decodedFilters
         }
         flickerFighter = min(1, max(0, defaults.double(forKey: "flickerFighter")))
-        if
-            let boxData = defaults.data(forKey: "captureBox"),
-            let decodedBox = try? JSONDecoder().decode(CaptureBox.self, from: boxData)
-        {
+        if let boxData = defaults.data(forKey: "captureBox"),
+           let decodedBox = try? JSONDecoder().decode(CaptureBox.self, from: boxData) {
             captureBox = decodedBox
         }
+        if let cropData = defaults.data(forKey: "videoCropBox"),
+           let decodedCrop = try? JSONDecoder().decode(VideoCropBox.self, from: cropData) {
+            videoCropBox = decodedCrop
+        }
+        loopVideo = defaults.object(forKey: "loopVideo") as? Bool ?? true
+        overlayMosaicEnabled = defaults.object(forKey: "overlayMosaicEnabled") as? Bool ?? true
+        if let path = defaults.string(forKey: "selectedVideoPath"), !path.isEmpty {
+            selectedVideo = URL(fileURLWithPath: path)
+        }
+        let savedVideoWidth = defaults.double(forKey: "videoWindowWidth")
+        let savedVideoHeight = defaults.double(forKey: "videoWindowHeight")
+        if savedVideoWidth > 0, savedVideoHeight > 0 {
+            videoWindowSize = CGSize(width: savedVideoWidth, height: savedVideoHeight)
+        }
+        if let loopData = defaults.data(forKey: "loopRange"),
+           let decodedLoop = try? JSONDecoder().decode(LoopRange.self, from: loopData) {
+            loopRange = decodedLoop.clamped()
+        }
+        defaults.removeObject(forKey: "dockedPanelWidth")
+        defaults.removeObject(forKey: "dockedPanelVisible")
+    }
+
+    private func videoDirectoryURL() -> URL {
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("Videos")
+    }
+
+    private func resolvedVideoDirectoryURL() -> URL {
+        let fm = FileManager.default
+        let cwdVideos = videoDirectoryURL()
+        if directoryContainsVideos(cwdVideos) { return cwdVideos }
+
+        let bundleDir = Bundle.main.bundleURL.deletingLastPathComponent()
+        let siblingVideos = bundleDir.appendingPathComponent("Videos")
+        if directoryContainsVideos(siblingVideos) { return siblingVideos }
+
+        let parentVideos = bundleDir.deletingLastPathComponent().appendingPathComponent("Videos")
+        if directoryContainsVideos(parentVideos) { return parentVideos }
+        if fm.fileExists(atPath: parentVideos.path) { return parentVideos }
+        if fm.fileExists(atPath: siblingVideos.path) { return siblingVideos }
+        return cwdVideos
+    }
+
+    private func directoryContainsVideos(_ directory: URL) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: directory.path) else { return false }
+        guard let items = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return false }
+        return items.contains { $0.pathExtension.lowercased() == "mp4" }
     }
 
     private func updatePreview(_ frame: RGBFrame) {
-        let now = Date()
-        guard now.timeIntervalSince(lastPreviewUpdate) > 0.15 else { return }
-        lastPreviewUpdate = now
-        txPreviewInfo = "\(frame.width)x\(frame.height) · \(sampleString(frame))"
-        txPreviewImage = makePreviewImage(frame)
+        let image = makePreviewImage(frame)
+        lastMosaicImage = image
+        overlay?.mosaicImage = image
     }
 
-    private func sampleString(_ frame: RGBFrame) -> String {
-        let count = min(9, frame.pixels.count)
-        guard count > 0 else { return "empty" }
-        let values = frame.pixels.prefix(count).map { String(format: "%02X", $0) }
-        return values.joined(separator: " ")
+    private func syncOverlayVisualizationSettings() {
+        overlay?.mosaicEnabled = overlayMosaicEnabled
+    }
+
+    private func stopVideoPreview() {
+        videoPreviewSource?.stop()
+        videoPreviewSource = nil
+    }
+
+    private func refreshVideoPreviewIfNeeded() {
+        guard captureMode == .video else {
+            stopVideoPreview()
+            return
+        }
+        guard isStreaming == false else {
+            stopVideoPreview()
+            return
+        }
+        guard overlay?.window?.isVisible == true else {
+            stopVideoPreview()
+            return
+        }
+        guard let selectedVideo else {
+            stopVideoPreview()
+            return
+        }
+
+        stopVideoPreview()
+        do {
+            let preview = try VideoFrameSource(
+                url: selectedVideo,
+                fps: fps,
+                crop: videoCropBox,
+                loop: loopVideo,
+                loopRange: loopRange
+            )
+            preview.onFrame = { [weak self] frame in
+                Task { @MainActor in
+                    self?.updatePreview(frame)
+                }
+            }
+            preview.onPreviewBuffer = { [weak self] buffer in
+                Task { @MainActor in
+                    self?.overlay?.setPreviewBuffer(buffer)
+                }
+            }
+            videoPreviewSource = preview
+        } catch {
+            Log.capture.error("video preview start failed: \(error.localizedDescription)")
+        }
+    }
+
+    func beginLoopScrub() {
+        isScrubbing = true
+        videoPreviewSource?.stop()
+        videoPreviewSource = nil
+        videoSource?.stop()
+        videoSource = nil
+        guard let selectedVideo else { return }
+        if scrubAssetURL != selectedVideo {
+            let asset = AVAsset(url: selectedVideo)
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.requestedTimeToleranceBefore = CMTime(seconds: 0.05, preferredTimescale: 600)
+            generator.requestedTimeToleranceAfter = CMTime(seconds: 0.05, preferredTimescale: 600)
+            generator.maximumSize = CGSize(width: 720, height: 720)
+            scrubGenerator = generator
+            scrubAssetURL = selectedVideo
+            scrubAssetDuration = .zero
+            Task { [weak self] in
+                let duration = (try? await asset.load(.duration)) ?? .zero
+                await MainActor.run {
+                    guard let self else { return }
+                    self.scrubAssetDuration = duration
+                }
+            }
+        }
+    }
+
+    func scrubLoopRange(toRatio ratio: Double) {
+        guard let generator = scrubGenerator else { return }
+        let totalSec = CMTimeGetSeconds(scrubAssetDuration)
+        guard totalSec.isFinite, totalSec > 0 else { return }
+        let clamped = max(0, min(1, ratio))
+        let time = CMTime(seconds: totalSec * clamped, preferredTimescale: 600)
+        generator.generateCGImageAsynchronously(for: time) { [weak self] cgImage, _, _ in
+            guard let self, let cgImage else { return }
+            let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+            Task { @MainActor in
+                self.overlay?.setPreviewImage(image)
+            }
+        }
+    }
+
+    func commitLoopRange(_ range: LoopRange) {
+        isScrubbing = false
+        let clamped = range.clamped()
+        let changed = loopRange != clamped
+        loopRange = clamped
+        persist()
+        if isStreaming, captureMode == .video {
+            restartStreaming()
+        } else if changed || captureMode == .video {
+            refreshVideoPreviewIfNeeded()
+        }
     }
 
     private func makePreviewImage(_ frame: RGBFrame) -> NSImage? {
@@ -410,12 +721,4 @@ final class AppModel: ObservableObject {
         }
         return NSImage(cgImage: cgImage, size: NSSize(width: frame.width, height: frame.height))
     }
-}
-
-private func format(diagnostics diag: DisplayFrameSource.Diagnostics) -> String {
-    let displayPart = "display \(diag.displayID)"
-    let framePart = "frame \(Int(diag.framePixels.width))x\(Int(diag.framePixels.height)) px"
-    let srcPart = "src \(Int(diag.sourceRect.minX)),\(Int(diag.sourceRect.minY)) \(Int(diag.sourceRect.width))x\(Int(diag.sourceRect.height)) pt"
-    let countPart = "\(diag.deliveredFrames) frames"
-    return [displayPart, framePart, srcPart, countPart].joined(separator: "  ·  ")
 }

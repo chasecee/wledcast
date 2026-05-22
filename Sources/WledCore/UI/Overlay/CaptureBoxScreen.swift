@@ -33,6 +33,26 @@ public extension CaptureBox {
         )
     }
 
+    func windowRect(on screen: NSScreen, settingsHeight: CGFloat) -> NSRect {
+        let topRect = nsRect(on: screen)
+        return NSRect(
+            x: topRect.minX,
+            y: topRect.minY - settingsHeight,
+            width: topRect.width,
+            height: topRect.height + settingsHeight
+        )
+    }
+
+    init(windowFrame: NSRect, settingsHeight: CGFloat, screen: NSScreen) {
+        let topRect = NSRect(
+            x: windowFrame.minX,
+            y: windowFrame.minY + settingsHeight,
+            width: windowFrame.width,
+            height: max(1, windowFrame.height - settingsHeight)
+        )
+        self.init(nsFrame: topRect, screen: screen)
+    }
+
     static func centered(on screen: NSScreen, size: CGFloat = 500) -> CaptureBox {
         let w = min(size, screen.frame.width)
         let h = min(size, screen.frame.height)

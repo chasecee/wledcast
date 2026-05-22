@@ -6,10 +6,20 @@ public protocol HTTPClient: Sendable {
 }
 
 public struct URLSessionHTTPClient: HTTPClient {
-    public init() {}
+    private let session: URLSession
+
+    public init(timeout: TimeInterval = 2.0) {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = timeout
+        config.timeoutIntervalForResource = timeout
+        config.waitsForConnectivity = false
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        self.session = URLSession(configuration: config)
+    }
 
     public func get(url: URL) async throws -> (Data, HTTPURLResponse) {
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await session.data(from: url)
         guard let http = response as? HTTPURLResponse else {
             throw NSError(domain: "HTTPClient", code: 1)
         }
@@ -91,6 +101,17 @@ public actor WLEDDiscoveryClient {
         guard !trimmed.isEmpty else { return }
         hostCandidates.insert(trimmed)
         await probeNewHosts([trimmed])
+    }
+
+    public func inject(host: String, resolution: OutputResolution) {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        hostCandidates.insert(trimmed)
+        let previous = verifiedHosts[trimmed]
+        verifiedHosts[trimmed] = resolution
+        if previous != resolution {
+            continuation?.yield(snapshotHosts())
+        }
     }
 
     public func stop() {

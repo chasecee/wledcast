@@ -1,42 +1,50 @@
 import AppKit
+import CoreImage
+import CoreVideo
 import Foundation
 import SwiftUI
 
 public final class OverlayWindowController: NSWindowController, ObservableObject {
     public var onChange: ((CaptureBox) -> Void)?
+    public var onVideoCropChange: ((VideoCropBox) -> Void)?
+    public var onTopRegionSizeChange: ((CGSize) -> Void)?
     public var aspectLock = true
     @Published public var outputResolution = OutputResolution(width: 1, height: 1)
+    @Published public var mosaicEnabled = false
+    @Published public var mosaicImage: NSImage?
+    @Published public var mode: CaptureMode = .region
+    @Published public private(set) var previewImage: NSImage?
+    @Published public private(set) var videoCropBox: VideoCropBox = .full
+    @Published public private(set) var captureBox: CaptureBox
+    @Published private var settingsContent: AnyView = AnyView(EmptyView())
+    private let ciContext = CIContext(options: nil)
+    private var videoAspectRatio: CGFloat?
+    private var dragOriginFrame: NSRect?
+    private var resizeOriginTopFrame: NSRect?
+    private var dragOriginMouse: NSPoint?
+    private var monitor: Any?
+    private var settingsHeight: CGFloat = 320
+    private var minimumSettingsWidth: CGFloat = 360
+    private let minimumTopSide: CGFloat = 32
 
     public var captureWindowID: CGWindowID? {
         guard let number = window?.windowNumber, number > 0 else { return nil }
         return CGWindowID(number)
     }
 
-    @Published public private(set) var captureBox: CaptureBox
-    private var dragOriginFrame: NSRect?
-    private var dragOriginMouse: NSPoint?
-    private var monitor: Any?
-
     public init(captureBox: CaptureBox) {
-        let initialScreen = NSScreen.screen(for: captureBox.displayID)
-            ?? NSScreen.main
-            ?? NSScreen.screens.first!
+        let initialScreen = NSScreen.screen(for: captureBox.displayID) ?? NSScreen.main ?? NSScreen.screens.first!
         let resolved: CaptureBox
         let initialFrame: NSRect
         if NSScreen.screen(for: captureBox.displayID) != nil {
             resolved = captureBox
-            initialFrame = captureBox.nsRect(on: initialScreen)
+            initialFrame = captureBox.windowRect(on: initialScreen, settingsHeight: settingsHeight)
         } else {
             resolved = CaptureBox.centered(on: initialScreen)
-            initialFrame = resolved.nsRect(on: initialScreen)
+            initialFrame = resolved.windowRect(on: initialScreen, settingsHeight: settingsHeight)
         }
         self.captureBox = resolved
-        let window = OverlayPanel(
-            contentRect: initialFrame,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
+        let window = OverlayWindow(contentRect: initialFrame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.isOpaque = false
         window.backgroundColor = .clear
         window.level = .floating
@@ -47,13 +55,79 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
         window.sharingType = .none
         window.isReleasedWhenClosed = false
         super.init(window: window)
-        let view = OverlayHUD(controller: self)
-        window.contentView = NSHostingView(rootView: view)
+        window.contentView = NSHostingView(rootView: UnifiedOverlayRoot(controller: self))
+        updateWindowMinimums()
     }
 
     @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    public func setMode(_ mode: CaptureMode) {
+        self.mode = mode
+        if mode == .video {
+            enforceVideoAspectOnTopRegion()
+        }
+    }
+    public func setVideoCrop(_ crop: VideoCropBox) { videoCropBox = normalize(crop) }
+    public func setSettingsContent(_ content: AnyView) { settingsContent = content }
+    public func setSettingsHeight(_ height: CGFloat) {
+        let resolved = max(1, height)
+        guard abs(resolved - settingsHeight) > 0.5 else { return }
+        guard let window else {
+            settingsHeight = resolved
+            return
+        }
+        let topFrame = Self.topRegionFrame(windowFrame: window.frame, settingsHeight: settingsHeight)
+        settingsHeight = resolved
+        updateWindowMinimums()
+        applyWindowFrame(Self.windowFrame(topRegionFrame: topFrame, settingsHeight: settingsHeight))
+    }
+
+    public func setMinimumSettingsWidth(_ width: CGFloat) {
+        minimumSettingsWidth = max(minimumTopSide, width)
+        updateWindowMinimums()
+    }
+
+    public func setTopRegionSize(_ size: CGSize) {
+        guard let window else { return }
+        var topFrame = Self.topRegionFrame(windowFrame: window.frame, settingsHeight: settingsHeight)
+        topFrame.size.width = max(minimumSettingsWidth, size.width)
+        topFrame.size.height = max(minimumTopSide, size.height)
+        applyTopFrame(topFrame)
+    }
+
+    public func setPreviewImage(_ image: NSImage) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.previewImage = image
+            guard image.size.width > 0, image.size.height > 0 else { return }
+            let nextAspect = max(0.0001, image.size.width / image.size.height)
+            let previousAspect = self.videoAspectRatio
+            self.videoAspectRatio = nextAspect
+            if self.mode == .video, previousAspect == nil || abs((previousAspect ?? nextAspect) - nextAspect) > 0.05 {
+                self.enforceVideoAspectOnTopRegion()
+            }
+        }
+    }
+
+    public func setPreviewBuffer(_ pixelBuffer: CVPixelBuffer) {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let rect = ciImage.extent
+        guard let cg = ciContext.createCGImage(ciImage, from: rect) else { return }
+        let image = NSImage(cgImage: cg, size: NSSize(width: rect.width, height: rect.height))
+        let width = rect.width
+        let height = rect.height
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.previewImage = image
+            guard self.mode == .video, width > 0, height > 0 else { return }
+            let nextAspect = max(0.0001, width / height)
+            let previousAspect = self.videoAspectRatio
+            self.videoAspectRatio = nextAspect
+            if previousAspect == nil || abs((previousAspect ?? nextAspect) - nextAspect) > 0.05 {
+                self.enforceVideoAspectOnTopRegion()
+            }
+        }
     }
 
     public func show() {
@@ -73,7 +147,7 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
         var frame = window.frame
         frame.origin.x += dx
         frame.origin.y += dy
-        apply(frame)
+        applyWindowFrame(frame)
     }
 
     public func startDrag() {
@@ -85,98 +159,113 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
     public func move() {
         guard let start = dragOriginFrame, let startMouse = dragOriginMouse else { return }
         let currentMouse = NSEvent.mouseLocation
-        let dx = currentMouse.x - startMouse.x
-        let dy = currentMouse.y - startMouse.y
         var frame = start
-        frame.origin.x += dx
-        frame.origin.y += dy
-        apply(frame)
+        frame.origin.x += currentMouse.x - startMouse.x
+        frame.origin.y += currentMouse.y - startMouse.y
+        applyWindowFrame(frame)
     }
 
     public func startResize() {
-        guard dragOriginFrame == nil, let window else { return }
-        dragOriginFrame = window.frame
+        guard resizeOriginTopFrame == nil, dragOriginMouse == nil, let window else { return }
+        resizeOriginTopFrame = Self.topRegionFrame(windowFrame: window.frame, settingsHeight: settingsHeight)
         dragOriginMouse = NSEvent.mouseLocation
     }
 
     public func resize(handle: OverlayHandle) {
-        guard let start = dragOriginFrame, let startMouse = dragOriginMouse else { return }
+        guard let start = resizeOriginTopFrame, let startMouse = dragOriginMouse else { return }
         let currentMouse = NSEvent.mouseLocation
         let dx = currentMouse.x - startMouse.x
         let dy = currentMouse.y - startMouse.y
-        var frame = start
-        let minSize: CGFloat = 32
-
+        var topFrame = start
         switch handle {
         case .topLeft:
-            frame.origin.x += dx
-            frame.size.width -= dx
-            frame.size.height += dy
+            topFrame.origin.x += dx; topFrame.size.width -= dx; topFrame.size.height += dy
         case .top:
-            frame.size.height += dy
+            topFrame.size.height += dy
         case .topRight:
-            frame.size.width += dx
-            frame.size.height += dy
+            topFrame.size.width += dx; topFrame.size.height += dy
         case .right:
-            frame.size.width += dx
+            topFrame.size.width += dx
         case .bottomRight:
-            frame.size.width += dx
-            frame.origin.y += dy
-            frame.size.height -= dy
+            topFrame.size.width += dx; topFrame.origin.y += dy; topFrame.size.height -= dy
         case .bottom:
-            frame.origin.y += dy
-            frame.size.height -= dy
+            topFrame.origin.y += dy; topFrame.size.height -= dy
         case .bottomLeft:
-            frame.origin.x += dx
-            frame.size.width -= dx
-            frame.origin.y += dy
-            frame.size.height -= dy
+            topFrame.origin.x += dx; topFrame.size.width -= dx; topFrame.origin.y += dy; topFrame.size.height -= dy
         case .left:
-            frame.origin.x += dx
-            frame.size.width -= dx
+            topFrame.origin.x += dx; topFrame.size.width -= dx
         }
-
-        if aspectLock, outputResolution.height > 0 {
-            let ratio = CGFloat(outputResolution.width) / CGFloat(outputResolution.height)
+        if let ratio = aspectRatioForCurrentMode() {
             let widthDominant = abs(dx) >= abs(dy)
             if widthDominant {
-                let newHeight = max(minSize, frame.width / ratio)
-                let delta = frame.height - newHeight
-                frame.size.height = newHeight
-                if handle == .bottom || handle == .bottomLeft || handle == .bottomRight {
-                    frame.origin.y += delta
-                }
+                let newHeight = max(minimumTopSide, topFrame.width / ratio)
+                let delta = topFrame.height - newHeight
+                topFrame.size.height = newHeight
+                if handle == .bottom || handle == .bottomLeft || handle == .bottomRight { topFrame.origin.y += delta }
             } else {
-                let newWidth = max(minSize, frame.height * ratio)
-                let delta = frame.width - newWidth
-                frame.size.width = newWidth
-                if handle == .left || handle == .topLeft || handle == .bottomLeft {
-                    frame.origin.x += delta
-                }
+                let newWidth = max(minimumTopSide, topFrame.height * ratio)
+                let delta = topFrame.width - newWidth
+                topFrame.size.width = newWidth
+                if handle == .left || handle == .topLeft || handle == .bottomLeft { topFrame.origin.x += delta }
             }
         }
-
-        frame.size.width = max(minSize, frame.size.width)
-        frame.size.height = max(minSize, frame.size.height)
-        apply(frame)
+        topFrame.size.width = max(minimumSettingsWidth, topFrame.size.width)
+        topFrame.size.height = max(minimumTopSide, topFrame.size.height)
+        applyTopFrame(topFrame)
     }
 
     public func endDrag() {
         dragOriginFrame = nil
+        resizeOriginTopFrame = nil
         dragOriginMouse = nil
     }
 
-    private func apply(_ frame: NSRect) {
-        let clamped = clampToScreen(frame)
-        window?.setFrame(clamped, display: true)
-        updateBox(from: clamped)
+    public func updateVideoCrop(_ box: VideoCropBox) {
+        videoCropBox = normalize(box)
+        onVideoCropChange?(videoCropBox)
     }
 
-    fileprivate func updateBox(from frame: NSRect) {
-        let screen = NSScreen.screens.max {
-            $0.frame.intersection(frame).rectArea < $1.frame.intersection(frame).rectArea
-        } ?? NSScreen.main ?? NSScreen.screens.first!
-        captureBox = CaptureBox(nsFrame: frame, screen: screen)
+    private func normalize(_ box: VideoCropBox) -> VideoCropBox {
+        let x = min(1, max(0, box.x))
+        let y = min(1, max(0, box.y))
+        let width = min(1 - x, max(0.01, box.width))
+        let height = min(1 - y, max(0.01, box.height))
+        return VideoCropBox(x: x, y: y, width: width, height: height)
+    }
+
+    private func aspectRatioForCurrentMode() -> CGFloat? {
+        if mode == .video, let videoAspectRatio {
+            return max(0.0001, videoAspectRatio)
+        }
+        guard aspectLock, outputResolution.height > 0 else { return nil }
+        return CGFloat(outputResolution.width) / CGFloat(outputResolution.height)
+    }
+
+    private func enforceVideoAspectOnTopRegion() {
+        guard mode == .video, let ratio = videoAspectRatio, let window else { return }
+        var topFrame = Self.topRegionFrame(windowFrame: window.frame, settingsHeight: settingsHeight)
+        let centerY = topFrame.midY
+        topFrame.size.width = max(minimumSettingsWidth, topFrame.width)
+        topFrame.size.height = max(minimumTopSide, topFrame.width / ratio)
+        topFrame.origin.y = centerY - (topFrame.height / 2)
+        applyTopFrame(topFrame)
+    }
+
+    private func applyTopFrame(_ topFrame: NSRect) {
+        applyWindowFrame(Self.windowFrame(topRegionFrame: topFrame, settingsHeight: settingsHeight))
+    }
+
+    private func applyWindowFrame(_ frame: NSRect) {
+        let clamped = clampToScreen(frame)
+        window?.setFrame(clamped, display: true)
+        let topFrame = Self.topRegionFrame(windowFrame: clamped, settingsHeight: settingsHeight)
+        updateBox(fromTopFrame: topFrame)
+        onTopRegionSizeChange?(topFrame.size)
+    }
+
+    fileprivate func updateBox(fromTopFrame topFrame: NSRect) {
+        let screen = NSScreen.screens.max { $0.frame.intersection(topFrame).rectArea < $1.frame.intersection(topFrame).rectArea } ?? NSScreen.main ?? NSScreen.screens.first!
+        captureBox = CaptureBox(nsFrame: topFrame, screen: screen)
         onChange?(captureBox)
     }
 
@@ -186,82 +275,124 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
             guard let self else { return event }
             let step: CGFloat = event.modifierFlags.contains(.shift) ? 10 : 1
             switch event.keyCode {
-            case 123:
-                self.nudge(dx: -step, dy: 0)
-                return nil
-            case 124:
-                self.nudge(dx: step, dy: 0)
-                return nil
-            case 125:
-                self.nudge(dx: 0, dy: -step)
-                return nil
-            case 126:
-                self.nudge(dx: 0, dy: step)
-                return nil
-            default:
-                return event
+            case 123: self.nudge(dx: -step, dy: 0); return nil
+            case 124: self.nudge(dx: step, dy: 0); return nil
+            case 125: self.nudge(dx: 0, dy: -step); return nil
+            case 126: self.nudge(dx: 0, dy: step); return nil
+            default: return event
             }
         }
     }
 
     private func stopKeyMonitor() {
-        if let monitor {
-            NSEvent.removeMonitor(monitor)
-        }
+        if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
     }
 
     private func recoverIfOffscreen() {
         guard let window else { return }
         let frame = window.frame
-        let intersectsAny = NSScreen.screens.contains { $0.visibleFrame.intersects(frame) }
-
-        if intersectsAny {
+        if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(frame) }) {
             let clamped = clampToScreen(frame)
             if clamped != frame {
                 window.setFrame(clamped, display: true)
-                updateBox(from: clamped)
+                let topFrame = Self.topRegionFrame(windowFrame: clamped, settingsHeight: settingsHeight)
+                updateBox(fromTopFrame: topFrame)
+                onTopRegionSizeChange?(topFrame.size)
             }
             return
         }
-
         guard let target = NSScreen.main ?? NSScreen.screens.first else { return }
         let visible = target.visibleFrame
-        let width = min(max(32, frame.width), visible.width)
-        let height = min(max(32, frame.height), visible.height)
-        let centered = NSRect(
-            x: visible.minX + ((visible.width - width) / 2),
-            y: visible.minY + ((visible.height - height) / 2),
-            width: width,
-            height: height
-        )
+        let width = min(max(minimumSettingsWidth, frame.width), visible.width)
+        let height = min(max(minimumTopSide + settingsHeight, frame.height), visible.height)
+        let centered = NSRect(x: visible.minX + ((visible.width - width) / 2), y: visible.minY + ((visible.height - height) / 2), width: width, height: height)
         let clamped = clampToScreen(centered)
         window.setFrame(clamped, display: true)
-        updateBox(from: clamped)
+        let topFrame = Self.topRegionFrame(windowFrame: clamped, settingsHeight: settingsHeight)
+        updateBox(fromTopFrame: topFrame)
+        onTopRegionSizeChange?(topFrame.size)
     }
 
     private func clampToScreen(_ frame: NSRect) -> NSRect {
-        guard let screen = NSScreen.screens.first(where: { $0.visibleFrame.intersects(frame) }) ?? NSScreen.main ?? NSScreen.screens.first else {
-            return frame
-        }
+        guard let screen = NSScreen.screens.first(where: { $0.visibleFrame.intersects(frame) }) ?? NSScreen.main ?? NSScreen.screens.first else { return frame }
         let bounds = screen.visibleFrame
-        let minSize: CGFloat = 32
-
         var out = frame
-        out.size.width = min(max(minSize, out.width), bounds.width)
-        out.size.height = min(max(minSize, out.height), bounds.height)
-
+        let minHeight = minimumTopSide + settingsHeight
+        out.size.width = min(max(minimumSettingsWidth, out.width), bounds.width)
+        out.size.height = min(max(minHeight, out.height), bounds.height)
         if out.minX < bounds.minX { out.origin.x = bounds.minX }
         if out.minY < bounds.minY { out.origin.y = bounds.minY }
         if out.maxX > bounds.maxX { out.origin.x = bounds.maxX - out.width }
         if out.maxY > bounds.maxY { out.origin.y = bounds.maxY - out.height }
         return out
     }
+
+    private func updateWindowMinimums() {
+        guard let window else { return }
+        window.minSize = NSSize(width: minimumSettingsWidth, height: minimumTopSide + settingsHeight)
+    }
+
+    static func topRegionFrame(windowFrame: CGRect, settingsHeight: CGFloat) -> CGRect {
+        CGRect(
+            x: windowFrame.minX,
+            y: windowFrame.minY + settingsHeight,
+            width: windowFrame.width,
+            height: max(1, windowFrame.height - settingsHeight)
+        )
+    }
+
+    static func windowFrame(topRegionFrame: CGRect, settingsHeight: CGFloat) -> CGRect {
+        CGRect(
+            x: topRegionFrame.minX,
+            y: topRegionFrame.minY - settingsHeight,
+            width: topRegionFrame.width,
+            height: topRegionFrame.height + settingsHeight
+        )
+    }
+
+    static func minimumWindowSize(settingsHeight: CGFloat, minimumSettingsWidth: CGFloat, minimumTopSide: CGFloat = 32) -> CGSize {
+        CGSize(width: max(minimumTopSide, minimumSettingsWidth), height: max(minimumTopSide, minimumTopSide + settingsHeight))
+    }
+
+    static func fittedSize(for aspect: CGFloat, starting size: CGSize, minimumWidth: CGFloat, minimumHeight: CGFloat) -> CGSize {
+        var width = max(minimumWidth, size.width)
+        var height = max(minimumHeight, size.height)
+        if width / max(1, height) > aspect {
+            width = max(minimumWidth, height * aspect)
+        } else {
+            height = max(minimumHeight, width / aspect)
+        }
+        return CGSize(width: width, height: height)
+    }
+
+    static func mosaicRect(
+        mode: CaptureMode,
+        topSize: CGSize,
+        border: CGFloat,
+        videoRect: CGRect,
+        cropBox: VideoCropBox
+    ) -> CGRect {
+        if mode == .region {
+            return CGRect(
+                x: border,
+                y: border,
+                width: max(1, topSize.width - (border * 2)),
+                height: max(1, topSize.height - (border * 2))
+            )
+        }
+        return CGRect(
+            x: videoRect.minX + (videoRect.width * cropBox.x),
+            y: videoRect.minY + (videoRect.height * cropBox.y),
+            width: videoRect.width * cropBox.width,
+            height: videoRect.height * cropBox.height
+        )
+    }
 }
 
-private final class OverlayPanel: NSWindow {
+private final class OverlayWindow: NSWindow {
     override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
+    override var canBecomeMain: Bool { true }
 }
 
 private extension NSRect {
@@ -269,14 +400,29 @@ private extension NSRect {
 }
 
 public enum OverlayHandle: CaseIterable {
-    case topLeft
-    case top
-    case topRight
-    case right
-    case bottomRight
-    case bottom
-    case bottomLeft
-    case left
+    case topLeft, top, topRight, right, bottomRight, bottom, bottomLeft, left
+}
+
+private enum CropHandle: CaseIterable {
+    case topLeft, top, topRight, right, bottomRight, bottom, bottomLeft, left
+}
+
+private struct UnifiedOverlayRoot: View {
+    @ObservedObject var controller: OverlayWindowController
+
+    var body: some View {
+        GeometryReader { geo in
+            let topHeight = max(32, geo.size.height - controller.settingsHeightValue)
+            VStack(spacing: 0) {
+                OverlayHUD(controller: controller)
+                    .frame(width: geo.size.width, height: topHeight)
+                controller.settingsContentView
+                    .frame(width: geo.size.width, height: controller.settingsHeightValue, alignment: .topLeading)
+                    .background(.regularMaterial)
+            }
+        }
+        .background(.clear)
+    }
 }
 
 private struct OverlayHUD: View {
@@ -284,60 +430,206 @@ private struct OverlayHUD: View {
     private let border: CGFloat = 4
     private let dragRingThickness: CGFloat = 14
     private let handle: CGFloat = 14
+    @State private var cropDragStart: CGRect?
+    @State private var cropDragOrigin: CGPoint?
 
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                Rectangle()
-                    .stroke(.red.opacity(0.95), lineWidth: border)
-                    .padding(border / 2)
-                RingMoveLayer(border: dragRingThickness)
-                    .gesture(moveGesture)
+                contentLayer(in: geo.size)
+                if controller.mode == .region {
+                    Rectangle().stroke(.red.opacity(0.95), lineWidth: border).padding(border / 2)
+                }
+                if controller.mode == .region {
+                    RingMoveLayer(border: dragRingThickness).gesture(moveGesture)
+                }
                 handleLayer(in: geo.size)
+                if controller.mode == .video {
+                    videoCropLayer(in: geo.size)
+                }
                 sizeBadge
                     .padding(.top, 10)
                     .padding(.leading, 10)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                Rectangle()
-                    .fill(.clear)
-                    .padding(border * 2)
-                    .allowsHitTesting(false)
+                Rectangle().fill(.clear).padding(border * 2).allowsHitTesting(false)
             }
         }
         .background(.clear)
     }
 
+    @ViewBuilder
+    private func contentLayer(in size: CGSize) -> some View {
+        if controller.mode == .video {
+            if let image = controller.previewImage {
+                Image(nsImage: image).resizable().aspectRatio(contentMode: .fit).frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                Rectangle().fill(Color.black.opacity(0.35))
+            }
+        } else if controller.mosaicEnabled {
+            mosaicLayer(in: size)
+        }
+    }
+
+    @ViewBuilder
+    private func mosaicContent() -> some View {
+        if let image = controller.mosaicImage {
+            Image(nsImage: image).resizable().interpolation(.none).scaledToFill()
+        } else {
+            Rectangle().fill(Color.clear)
+        }
+    }
+
+    private func mosaicLayer(in size: CGSize) -> some View {
+        let inset = border
+        let innerWidth = max(1, size.width - (inset * 2))
+        let innerHeight = max(1, size.height - (inset * 2))
+        return mosaicContent().frame(width: innerWidth, height: innerHeight).clipped().position(x: size.width / 2, y: size.height / 2).allowsHitTesting(false)
+    }
+
     private var moveGesture: some Gesture {
         DragGesture(minimumDistance: 1)
-            .onChanged { _ in
-                controller.startDrag()
-                controller.move()
-            }
-            .onEnded { _ in
-                controller.endDrag()
-            }
+            .onChanged { _ in controller.startDrag(); controller.move() }
+            .onEnded { _ in controller.endDrag() }
     }
 
     @ViewBuilder
     private func handleLayer(in size: CGSize) -> some View {
         ForEach(OverlayHandle.allCases, id: \.self) { handleType in
-            Rectangle()
-                .fill(.white)
-                .frame(width: handle, height: handle)
-                .position(point(for: handleType, in: size))
-                .gesture(resizeGesture(for: handleType))
+            Rectangle().fill(.white).frame(width: handle, height: handle).position(point(for: handleType, in: size)).gesture(resizeGesture(for: handleType))
         }
     }
 
     private func resizeGesture(for handleType: OverlayHandle) -> some Gesture {
         DragGesture(minimumDistance: 1)
-            .onChanged { _ in
-                controller.startResize()
-                controller.resize(handle: handleType)
+            .onChanged { _ in controller.startResize(); controller.resize(handle: handleType) }
+            .onEnded { _ in controller.endDrag() }
+    }
+
+    @ViewBuilder
+    private func videoCropLayer(in size: CGSize) -> some View {
+        let videoRect = fittedVideoRect(in: size)
+        let cropRect = cropRect(in: videoRect)
+        ZStack {
+            VideoOuterMoveLayer(size: size, excludedRect: cropRect)
+                .gesture(moveGesture)
+            Rectangle().stroke(Color.red.opacity(0.95), lineWidth: 3).frame(width: cropRect.width, height: cropRect.height).position(x: cropRect.midX, y: cropRect.midY).gesture(videoMoveGesture(videoRect: videoRect, cropRect: cropRect))
+            ForEach(CropHandle.allCases, id: \.self) { cropHandle in
+                Rectangle().fill(.white).frame(width: 12, height: 12).position(point(for: cropHandle, in: cropRect)).gesture(videoResizeGesture(handle: cropHandle, videoRect: videoRect, cropRect: cropRect))
             }
-            .onEnded { _ in
-                controller.endDrag()
+            if controller.mosaicEnabled {
+                mosaicContent()
+                    .frame(width: cropRect.width, height: cropRect.height)
+                    .clipped()
+                    .position(x: cropRect.midX, y: cropRect.midY)
+                    .allowsHitTesting(false)
             }
+        }
+    }
+
+    private func fittedVideoRect(in container: CGSize) -> CGRect {
+        guard let image = controller.previewImage, image.size.width > 0, image.size.height > 0 else {
+            return CGRect(origin: .zero, size: container)
+        }
+        let imageAspect = image.size.width / image.size.height
+        let containerAspect = max(0.0001, container.width / max(1, container.height))
+        if imageAspect > containerAspect {
+            let width = container.width
+            let height = width / imageAspect
+            return CGRect(x: 0, y: (container.height - height) / 2, width: width, height: height)
+        }
+        let height = container.height
+        let width = height * imageAspect
+        return CGRect(x: (container.width - width) / 2, y: 0, width: width, height: height)
+    }
+
+    private func cropRect(in videoRect: CGRect) -> CGRect {
+        CGRect(x: videoRect.minX + (videoRect.width * controller.videoCropBox.x), y: videoRect.minY + (videoRect.height * controller.videoCropBox.y), width: videoRect.width * controller.videoCropBox.width, height: videoRect.height * controller.videoCropBox.height)
+    }
+
+    private func videoMoveGesture(videoRect: CGRect, cropRect: CGRect) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if cropDragStart == nil { cropDragStart = cropRect; cropDragOrigin = value.startLocation }
+                guard let start = cropDragStart, let origin = cropDragOrigin else { return }
+                var moved = start.offsetBy(dx: value.location.x - origin.x, dy: value.location.y - origin.y)
+                moved = clamp(rect: moved, in: videoRect)
+                controller.updateVideoCrop(toNormalized(moved, videoRect: videoRect))
+            }
+            .onEnded { _ in cropDragStart = nil; cropDragOrigin = nil }
+    }
+
+    private func videoResizeGesture(handle: CropHandle, videoRect: CGRect, cropRect: CGRect) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if cropDragStart == nil { cropDragStart = cropRect; cropDragOrigin = value.startLocation }
+                guard let start = cropDragStart, let origin = cropDragOrigin else { return }
+                var rect = resized(start: start, handle: handle, dx: value.location.x - origin.x, dy: value.location.y - origin.y)
+                if controller.aspectLock, controller.outputResolution.height > 0 {
+                    rect = applyAspectLock(rect: rect, handle: handle, in: videoRect)
+                }
+                rect = clampMinSize(rect: rect, minSide: 24)
+                rect = clamp(rect: rect, in: videoRect)
+                controller.updateVideoCrop(toNormalized(rect, videoRect: videoRect))
+            }
+            .onEnded { _ in cropDragStart = nil; cropDragOrigin = nil }
+    }
+
+    private func resized(start: CGRect, handle: CropHandle, dx: CGFloat, dy: CGFloat) -> CGRect {
+        var rect = start
+        switch handle {
+        case .topLeft: rect.origin.x += dx; rect.size.width -= dx; rect.origin.y += dy; rect.size.height -= dy
+        case .top: rect.origin.y += dy; rect.size.height -= dy
+        case .topRight: rect.size.width += dx; rect.origin.y += dy; rect.size.height -= dy
+        case .right: rect.size.width += dx
+        case .bottomRight: rect.size.width += dx; rect.size.height += dy
+        case .bottom: rect.size.height += dy
+        case .bottomLeft: rect.origin.x += dx; rect.size.width -= dx; rect.size.height += dy
+        case .left: rect.origin.x += dx; rect.size.width -= dx
+        }
+        return rect
+    }
+
+    private func applyAspectLock(rect: CGRect, handle: CropHandle, in videoRect: CGRect) -> CGRect {
+        var out = rect
+        let ratio = CGFloat(controller.outputResolution.width) / CGFloat(controller.outputResolution.height)
+        if out.width / max(1, out.height) > ratio {
+            let newHeight = out.width / ratio
+            let delta = newHeight - out.height
+            out.size.height = newHeight
+            if handle == .top || handle == .topLeft || handle == .topRight { out.origin.y -= delta }
+        } else {
+            let newWidth = out.height * ratio
+            let delta = newWidth - out.width
+            out.size.width = newWidth
+            if handle == .left || handle == .topLeft || handle == .bottomLeft { out.origin.x -= delta }
+        }
+        return clamp(rect: out, in: videoRect)
+    }
+
+    private func clampMinSize(rect: CGRect, minSide: CGFloat) -> CGRect {
+        var out = rect
+        if out.width < minSide { out.size.width = minSide }
+        if out.height < minSide { out.size.height = minSide }
+        return out
+    }
+
+    private func clamp(rect: CGRect, in bounds: CGRect) -> CGRect {
+        var out = rect
+        if out.width > bounds.width { out.size.width = bounds.width }
+        if out.height > bounds.height { out.size.height = bounds.height }
+        if out.minX < bounds.minX { out.origin.x = bounds.minX }
+        if out.minY < bounds.minY { out.origin.y = bounds.minY }
+        if out.maxX > bounds.maxX { out.origin.x = bounds.maxX - out.width }
+        if out.maxY > bounds.maxY { out.origin.y = bounds.maxY - out.height }
+        return out
+    }
+
+    private func toNormalized(_ rect: CGRect, videoRect: CGRect) -> VideoCropBox {
+        let x = (rect.minX - videoRect.minX) / max(1, videoRect.width)
+        let y = (rect.minY - videoRect.minY) / max(1, videoRect.height)
+        let width = rect.width / max(1, videoRect.width)
+        let height = rect.height / max(1, videoRect.height)
+        return VideoCropBox(x: x, y: y, width: width, height: height)
     }
 
     private func point(for handleType: OverlayHandle, in size: CGSize) -> CGPoint {
@@ -354,6 +646,19 @@ private struct OverlayHUD: View {
         }
     }
 
+    private func point(for handle: CropHandle, in rect: CGRect) -> CGPoint {
+        switch handle {
+        case .topLeft: return CGPoint(x: rect.minX, y: rect.minY)
+        case .top: return CGPoint(x: rect.midX, y: rect.minY)
+        case .topRight: return CGPoint(x: rect.maxX, y: rect.minY)
+        case .right: return CGPoint(x: rect.maxX, y: rect.midY)
+        case .bottomRight: return CGPoint(x: rect.maxX, y: rect.maxY)
+        case .bottom: return CGPoint(x: rect.midX, y: rect.maxY)
+        case .bottomLeft: return CGPoint(x: rect.minX, y: rect.maxY)
+        case .left: return CGPoint(x: rect.minX, y: rect.midY)
+        }
+    }
+
     private var sizeBadge: some View {
         Text("\(controller.captureBox.width)x\(controller.captureBox.height) -> \(controller.outputResolution.width)x\(controller.outputResolution.height)")
             .font(.system(size: 11, weight: .semibold))
@@ -365,34 +670,46 @@ private struct OverlayHUD: View {
     }
 }
 
+private struct VideoOuterMoveLayer: View {
+    let size: CGSize
+    let excludedRect: CGRect
+
+    var body: some View {
+        ZStack {
+            hitRect(CGRect(x: 0, y: 0, width: size.width, height: max(0, excludedRect.minY)))
+            hitRect(CGRect(x: 0, y: excludedRect.maxY, width: size.width, height: max(0, size.height - excludedRect.maxY)))
+            hitRect(CGRect(x: 0, y: excludedRect.minY, width: max(0, excludedRect.minX), height: excludedRect.height))
+            hitRect(CGRect(x: excludedRect.maxX, y: excludedRect.minY, width: max(0, size.width - excludedRect.maxX), height: excludedRect.height))
+        }
+    }
+
+    @ViewBuilder
+    private func hitRect(_ rect: CGRect) -> some View {
+        if rect.width > 0, rect.height > 0 {
+            Rectangle()
+                .fill(Color.white.opacity(0.001))
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+        }
+    }
+}
+
 private struct RingMoveLayer: View {
     let border: CGFloat
-
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                Rectangle()
-                    .fill(Color.white.opacity(0.001))
-                    .frame(width: geo.size.width, height: border)
-                    .position(x: geo.size.width / 2, y: border / 2)
-                    .contentShape(Rectangle())
-                Rectangle()
-                    .fill(Color.white.opacity(0.001))
-                    .frame(width: geo.size.width, height: border)
-                    .position(x: geo.size.width / 2, y: geo.size.height - border / 2)
-                    .contentShape(Rectangle())
-                Rectangle()
-                    .fill(Color.white.opacity(0.001))
-                    .frame(width: border, height: geo.size.height)
-                    .position(x: border / 2, y: geo.size.height / 2)
-                    .contentShape(Rectangle())
-                Rectangle()
-                    .fill(Color.white.opacity(0.001))
-                    .frame(width: border, height: geo.size.height)
-                    .position(x: geo.size.width - border / 2, y: geo.size.height / 2)
-                    .contentShape(Rectangle())
+                Rectangle().fill(Color.white.opacity(0.001)).frame(width: geo.size.width, height: border).position(x: geo.size.width / 2, y: border / 2).contentShape(Rectangle())
+                Rectangle().fill(Color.white.opacity(0.001)).frame(width: geo.size.width, height: border).position(x: geo.size.width / 2, y: geo.size.height - border / 2).contentShape(Rectangle())
+                Rectangle().fill(Color.white.opacity(0.001)).frame(width: border, height: geo.size.height).position(x: border / 2, y: geo.size.height / 2).contentShape(Rectangle())
+                Rectangle().fill(Color.white.opacity(0.001)).frame(width: border, height: geo.size.height).position(x: geo.size.width - border / 2, y: geo.size.height / 2).contentShape(Rectangle())
             }
             .contentShape(Rectangle())
         }
     }
+}
+
+private extension OverlayWindowController {
+    var settingsHeightValue: CGFloat { settingsHeight }
+    var settingsContentView: AnyView { settingsContent }
 }

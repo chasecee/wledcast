@@ -3,7 +3,6 @@ import WledCore
 
 struct MenuBarContent: View {
     @EnvironmentObject private var model: AppModel
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -42,10 +41,6 @@ struct MenuBarContent: View {
             }
             Button("Toggle Overlay") {
                 model.toggleOverlay()
-            }
-            Button("Settings") {
-                openWindow(id: "main")
-                NSApp.activate(ignoringOtherApps: true)
             }
             Button("Quit") {
                 model.quit()
