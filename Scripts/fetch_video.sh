@@ -47,8 +47,9 @@ fi
 src_template="$tmp_dir/source.%(ext)s"
 yt-dlp \
   --no-playlist \
+  --merge-output-format mp4 \
   -S "res:720,fps:60,vcodec:h264,ext:mp4" \
-  -f "bv*[ext=mp4][height<=720][fps<=60][vcodec^=avc1]/bv*[ext=mp4][height<=720][fps<=60]/b[ext=mp4][height<=720][fps<=60]/b[height<=720][fps<=60]" \
+  -f "bv*[ext=mp4][height<=720][fps<=60][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=720][fps<=60]+ba/b[ext=mp4][height<=720][fps<=60]/b[height<=720][fps<=60]" \
   -o "$src_template" \
   "$url"
 
@@ -67,8 +68,9 @@ if [[ -z "$duration" ]]; then
   exit 1
 fi
 
+audio_kbps=128
 target_bits=$((target_bytes * 8))
-video_kbps="$(awk -v bits="$target_bits" -v d="$duration" 'BEGIN { if (d <= 0) print 1200; else print int((bits / d) / 1000 * 0.92) }')"
+video_kbps="$(awk -v bits="$target_bits" -v d="$duration" -v a="$audio_kbps" 'BEGIN { if (d <= 0) print 1200; else print int(((bits / d) / 1000 - a) * 0.92) }')"
 if [[ "$video_kbps" -lt 350 ]]; then
   video_kbps=350
 fi
@@ -87,7 +89,8 @@ while [[ $attempt -le 4 ]]; do
     -vf "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease" \
     -c:v libx264 -preset veryfast \
     -b:v "${video_kbps}k" -maxrate "${maxrate_kbps}k" -bufsize "${bufsize_kbps}k" \
-    -pix_fmt yuv420p -movflags +faststart -an \
+    -pix_fmt yuv420p -movflags +faststart \
+    -c:a aac -b:a "${audio_kbps}k" -ac 2 \
     "$tmp_out"
 
   size_bytes="$(stat -f%z "$tmp_out")"

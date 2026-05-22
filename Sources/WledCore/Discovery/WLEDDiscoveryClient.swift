@@ -32,22 +32,30 @@ public actor WLEDDiscoveryClient {
     private var browser: NWBrowser?
     private let queue = DispatchQueue(label: "wledcast.discovery.browser")
     private var hostCandidates = Set<String>()
-    private var verifiedHosts: [String: OutputResolution] = [:]
+    private var verifiedHosts: [String: WLEDHostProfile] = [:]
     private var continuation: AsyncStream<[WLEDHost]>.Continuation?
 
     public init(httpClient: HTTPClient = URLSessionHTTPClient()) {
         self.httpClient = httpClient
     }
 
-    public func fetchMatrixResolution(host: String) async throws -> OutputResolution {
-        guard let url = infoURL(for: host) else {
+    public func fetchHostProfile(host: String) async throws -> WLEDHostProfile {
+        guard let infoURL = Self.infoURL(for: host) else {
             throw NSError(domain: "WLEDDiscoveryClient", code: 400)
         }
-        let (data, response) = try await httpClient.get(url: url)
-        guard response.statusCode == 200 else {
-            throw NSError(domain: "WLEDDiscoveryClient", code: response.statusCode)
+        async let infoRequest = httpClient.get(url: infoURL)
+        async let cfgData = Self.fetchCfgData(httpClient: httpClient, host: host)
+        let (infoData, infoResponse) = try await infoRequest
+        guard infoResponse.statusCode == 200 else {
+            throw NSError(domain: "WLEDDiscoveryClient", code: infoResponse.statusCode)
         }
-        return try WLEDInfoParser.matrixResolution(from: data)
+        let resolution = try WLEDInfoParser.matrixResolution(from: infoData)
+        let cfg = await cfgData
+        if cfg == nil {
+            Log.discovery.warning("cfg unavailable for \(host), falling back to info/default fps")
+        }
+        let targetFps = WLEDCfgParser.resolveTargetFps(infoData: infoData, cfgData: cfg)
+        return WLEDHostProfile(resolution: resolution, targetFps: targetFps)
     }
 
     public func discoverHosts(timeout: TimeInterval = 3) async -> [String] {
@@ -103,13 +111,13 @@ public actor WLEDDiscoveryClient {
         await probeNewHosts([trimmed])
     }
 
-    public func inject(host: String, resolution: OutputResolution) {
+    public func inject(host: String, profile: WLEDHostProfile) {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         hostCandidates.insert(trimmed)
         let previous = verifiedHosts[trimmed]
-        verifiedHosts[trimmed] = resolution
-        if previous != resolution {
+        verifiedHosts[trimmed] = profile
+        if previous != profile {
             continuation?.yield(snapshotHosts())
         }
     }
@@ -146,20 +154,23 @@ public actor WLEDDiscoveryClient {
     }
 
     private func probeNewHosts(_ hosts: Set<String>) async {
-        await withTaskGroup(of: (String, OutputResolution?).self) { group in
+        await withTaskGroup(of: (String, WLEDHostProfile?).self) { group in
             for host in hosts {
                 group.addTask { [httpClient] in
-                    guard let url = Self.infoURL(for: host) else {
+                    guard let infoURL = Self.infoURL(for: host) else {
                         return (host, nil)
                     }
                     do {
-                        let (data, response) = try await httpClient.get(url: url)
-                        guard response.statusCode == 200 else {
-                            Log.discovery.warning("probe \(host) http \(response.statusCode)")
+                        async let infoRequest = httpClient.get(url: infoURL)
+                        async let cfgData = Self.fetchCfgData(httpClient: httpClient, host: host)
+                        let (infoData, infoResponse) = try await infoRequest
+                        guard infoResponse.statusCode == 200 else {
+                            Log.discovery.warning("probe \(host) info http \(infoResponse.statusCode)")
                             return (host, nil)
                         }
-                        let resolution = try WLEDInfoParser.matrixResolution(from: data)
-                        return (host, resolution)
+                        let resolution = try WLEDInfoParser.matrixResolution(from: infoData)
+                        let targetFps = WLEDCfgParser.resolveTargetFps(infoData: infoData, cfgData: await cfgData)
+                        return (host, WLEDHostProfile(resolution: resolution, targetFps: targetFps))
                     } catch {
                         Log.discovery.warning("probe \(host) failed: \(error.localizedDescription)")
                         return (host, nil)
@@ -168,11 +179,13 @@ public actor WLEDDiscoveryClient {
             }
 
             while let result = await group.next() {
-                if let resolution = result.1 {
+                if let profile = result.1 {
                     let previous = verifiedHosts[result.0]
-                    verifiedHosts[result.0] = resolution
-                    if previous != resolution {
-                        Log.discovery.notice("verified \(result.0) \(resolution.width)x\(resolution.height)")
+                    verifiedHosts[result.0] = profile
+                    if previous != profile {
+                        Log.discovery.notice(
+                            "verified \(result.0) \(profile.resolution.width)x\(profile.resolution.height) \(profile.effectiveFps)fps"
+                        )
                     }
                 }
             }
@@ -182,7 +195,7 @@ public actor WLEDDiscoveryClient {
 
     private func snapshotHosts() -> [WLEDHost] {
         verifiedHosts
-            .map { WLEDHost(host: $0.key, resolution: $0.value) }
+            .map { WLEDHost(host: $0.key, resolution: $0.value.resolution, targetFps: $0.value.targetFps) }
             .sorted(by: { $0.host < $1.host })
     }
 
@@ -190,16 +203,28 @@ public actor WLEDDiscoveryClient {
         continuation = nil
     }
 
+    private static func fetchCfgData(httpClient: HTTPClient, host: String) async -> Data? {
+        for path in ["/cfg.json", "/json/cfg"] {
+            guard let url = apiURL(for: host, path: path) else { continue }
+            guard let (data, response) = try? await httpClient.get(url: url),
+                  response.statusCode == 200 else {
+                continue
+            }
+            return data
+        }
+        return nil
+    }
+
     private static func infoURL(for host: String) -> URL? {
+        apiURL(for: host, path: "/json/info")
+    }
+
+    private static func apiURL(for host: String, path: String) -> URL? {
         var components = URLComponents()
         components.scheme = "http"
         components.host = host.trimmingCharacters(in: .whitespacesAndNewlines)
         components.port = 80
-        components.path = "/json/info"
+        components.path = path
         return components.url
-    }
-
-    private func infoURL(for host: String) -> URL? {
-        Self.infoURL(for: host)
     }
 }

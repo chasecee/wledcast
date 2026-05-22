@@ -20,8 +20,7 @@ struct SettingsPaneView: View {
                 alignment: .leading,
                 spacing: 12
             ) {
-                OutputSection()
-                CaptureSection()
+                CaptureOutputSection()
                 if model.captureMode == .video {
                     VideoSourceSection()
                 }
@@ -78,11 +77,11 @@ private struct SectionCard<Content: View>: View {
     }
 }
 
-private struct OutputSection: View {
+private struct CaptureOutputSection: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        SectionCard(title: "Output", systemImage: "antenna.radiowaves.left.and.right") {
+        SectionCard(title: "Capture & Output", systemImage: "viewfinder") {
             Picker("Mode", selection: Binding(
                 get: { model.captureMode },
                 set: { model.setCaptureMode($0) }
@@ -93,38 +92,40 @@ private struct OutputSection: View {
             .pickerStyle(.segmented)
             .labelsHidden()
 
-            Picker("WLED host", selection: Binding(
-                get: { model.selectedHost },
-                set: { model.setHost($0) }
-            )) {
-                if model.hosts.isEmpty {
-                    Text("No verified hosts").tag("")
-                } else {
-                    ForEach(model.hosts) { host in
-                        Text("\(host.host)  \(host.resolution.width)x\(host.resolution.height)")
-                            .tag(host.host)
+            HStack(spacing: 8) {
+                Picker("WLED host", selection: Binding(
+                    get: { model.selectedHost },
+                    set: { model.setHost($0) }
+                )) {
+                    if model.hosts.isEmpty {
+                        if model.selectedHost.isEmpty {
+                            Text("No verified hosts").tag("")
+                        } else {
+                            Text(model.selectedHost).tag(model.selectedHost)
+                        }
+                    } else {
+                        ForEach(model.hosts) { host in
+                            Text("\(host.host)  \(host.resolution.width)x\(host.resolution.height)")
+                                .tag(host.host)
+                        }
                     }
                 }
-            }
-        }
-    }
-}
 
-private struct CaptureSection: View {
-    @EnvironmentObject private var model: AppModel
-
-    var body: some View {
-        SectionCard(title: "Capture", systemImage: "viewfinder") {
-            Stepper(value: Binding(
-                get: { model.fps },
-                set: { model.setFPS($0) }
-            ), in: 1...120) {
-                HStack {
-                    Label("Frame Rate", systemImage: "speedometer")
-                    Spacer()
-                    Text("\(model.fps) fps")
-                        .foregroundStyle(.secondary)
+                Button(model.isStreaming ? "Stop" : "Start") {
+                    if model.isStreaming {
+                        model.stopStreaming()
+                    } else {
+                        model.startStreaming()
+                    }
                 }
+                .disabled(!model.isStreaming && !model.canStartStreaming)
+            }
+
+            HStack {
+                Label("Frame Rate", systemImage: "speedometer")
+                Spacer()
+                Text(model.wledFpsLabel)
+                    .foregroundStyle(.secondary)
             }
 
             Toggle("Lock output ratio", isOn: Binding(
@@ -132,7 +133,7 @@ private struct CaptureSection: View {
                 set: { model.setAspectLock($0) }
             ))
 
-            Toggle("Show mosaic in overlay", isOn: Binding(
+            Toggle("Show mosaic in preview", isOn: Binding(
                 get: { model.overlayMosaicEnabled },
                 set: { model.setOverlayMosaicEnabled($0) }
             ))
@@ -183,6 +184,8 @@ private struct VideoSourceSection: View {
                 set: { model.setLoopVideo($0) }
             ))
 
+            AudioControls()
+
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Label("Loop Range", systemImage: "timeline.selection")
@@ -195,7 +198,7 @@ private struct VideoSourceSection: View {
                 LoopRangeSlider(
                     range: $model.loopRange,
                     onScrubBegin: { model.beginLoopScrub() },
-                    onScrubChange: { ratio in model.scrubLoopRange(toRatio: ratio) },
+                    onScrubChange: { handle, ratio in model.scrubLoopRange(handle: handle, ratio: ratio) },
                     onCommit: { model.commitLoopRange(model.loopRange) }
                 )
             }
@@ -211,10 +214,51 @@ private struct VideoSourceSection: View {
     }
 }
 
+private struct AudioControls: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button {
+                model.setAudioMuted(!model.audioMuted)
+            } label: {
+                Image(systemName: muteIcon)
+                    .frame(width: 18)
+            }
+            .buttonStyle(.borderless)
+            .help(model.audioMuted ? "Unmute" : "Mute")
+
+            Slider(value: Binding(
+                get: { model.audioVolume },
+                set: { model.setAudioVolume($0) }
+            ), in: 0...1)
+            .disabled(model.audioMuted)
+
+            Text("\(Int((model.audioMuted ? 0 : model.audioVolume) * 100))%")
+                .frame(width: 40, alignment: .trailing)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var muteIcon: String {
+        if model.audioMuted { return "speaker.slash.fill" }
+        if model.audioVolume <= 0.01 { return "speaker.fill" }
+        if model.audioVolume < 0.34 { return "speaker.wave.1.fill" }
+        if model.audioVolume < 0.67 { return "speaker.wave.2.fill" }
+        return "speaker.wave.3.fill"
+    }
+}
+
+enum LoopScrubHandle {
+    case start
+    case end
+}
+
 private struct LoopRangeSlider: View {
     @Binding var range: LoopRange
     var onScrubBegin: () -> Void
-    var onScrubChange: (Double) -> Void
+    var onScrubChange: (LoopScrubHandle, Double) -> Void
     var onCommit: () -> Void
 
     @State private var activeHandle: Handle?
@@ -268,11 +312,11 @@ private struct LoopRangeSlider: View {
                 case .start:
                     next.start = min(max(0, raw), range.end - LoopRange.minSpan)
                     range = next
-                    onScrubChange(next.start)
+                    onScrubChange(.start, next.start)
                 case .end:
                     next.end = max(min(1, raw), range.start + LoopRange.minSpan)
                     range = next
-                    onScrubChange(next.end)
+                    onScrubChange(.end, next.end)
                 }
             }
             .onEnded { _ in

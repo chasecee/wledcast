@@ -39,7 +39,7 @@ struct MenuBarContent: View {
                     model.startStreaming()
                 }
             }
-            Button("Toggle Overlay") {
+            Button(model.isWindowVisible ? "Hide Window" : "Show Window") {
                 model.toggleOverlay()
             }
             Button("Quit") {
@@ -57,6 +57,6 @@ struct MenuBarContent: View {
         case .stopped: "stopped"
         }
         let host = model.selectedHost.isEmpty ? "no host" : model.selectedHost
-        return "\(model.isStreaming ? "Streaming" : "Idle") · \(host) · \(state) · \(model.fps) fps"
+        return "\(model.isStreaming ? "Streaming" : "Idle") · \(host) · \(state) · \(model.wledFpsLabel)"
     }
 }

@@ -9,31 +9,67 @@ public final class VideoFrameSource: @unchecked Sendable {
     public var onPreviewBuffer: ((CVPixelBuffer) -> Void)?
 
     public private(set) var videoSize: CGSize = .zero
+    public private(set) var sourceFps: Float = 30
 
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "wledcast.video.source", qos: .userInteractive)
     private let queueKey = DispatchSpecificKey<Void>()
     private var timer: DispatchSourceTimer?
     private var outputFps: Int
+    private var playbackRate: Float = 1
     private var crop: VideoCropBox
     private let loop: Bool
     private var loopRange: LoopRange
     private let asset: AVAsset
+    private let decodeTarget: OutputResolution?
+    private let playbackClock: (() -> CMTime)?
     private var assetDuration: CMTime = .zero
     private var track: AVAssetTrack?
     private var reader: AVAssetReader?
     private var output: AVAssetReaderTrackOutput?
+    private var decodeSize: CGSize = .zero
+    private var heldSample: CMSampleBuffer?
+    private var pendingSample: CMSampleBuffer?
+    private var wallClockStart: CFAbsoluteTime?
+    private var rangeStartSeconds: Double = 0
+    private var mutedPlayback = false
+    private var wallClockAnchor: (media: CMTime, wall: CFAbsoluteTime)?
 
-    public init(url: URL, fps: Int, crop: VideoCropBox, loop: Bool, loopRange: LoopRange = .full) throws {
+    public init(
+        url: URL,
+        fps: Int,
+        crop: VideoCropBox,
+        loop: Bool,
+        loopRange: LoopRange = .full,
+        decodeTarget: OutputResolution? = nil,
+        playbackClock: (() -> CMTime)? = nil
+    ) throws {
         self.asset = AVAsset(url: url)
         self.outputFps = max(1, fps)
         self.crop = crop
         self.loop = loop
         self.loopRange = loopRange.clamped()
+        self.decodeTarget = decodeTarget
+        self.playbackClock = playbackClock
         queue.setSpecific(key: queueKey, value: ())
         try setupTrack()
         try startReader()
         scheduleTimer()
+    }
+
+    public static func loadSourceFps(url: URL) -> Float {
+        let asset = AVAsset(url: url)
+        let semaphore = DispatchSemaphore(value: 0)
+        var fps: Float = 30
+        Task {
+            if let track = try? await asset.loadTracks(withMediaType: .video).first,
+               let rate = try? await track.load(.nominalFrameRate), rate > 1 {
+                fps = rate
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return fps
     }
 
     public func stop() {
@@ -51,12 +87,69 @@ public final class VideoFrameSource: @unchecked Sendable {
         reader?.cancelReading()
         reader = nil
         output = nil
+        heldSample = nil
+        pendingSample = nil
         lock.unlock()
     }
 
     public func setOutputFps(_ fps: Int) {
         outputFps = max(1, fps)
         scheduleTimer()
+    }
+
+    public func setPlaybackRate(_ rate: Float) {
+        lock.lock()
+        playbackRate = max(0.01, min(1, rate))
+        lock.unlock()
+    }
+
+    public func beginMutedPlayback(at time: CMTime) {
+        let work = { [weak self] in
+            guard let self else { return }
+            self.mutedPlayback = true
+            self.wallClockAnchor = (time, CFAbsoluteTimeGetCurrent())
+        }
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            work()
+        } else {
+            queue.async(execute: work)
+        }
+    }
+
+    public func endMutedPlayback() {
+        let work = { [weak self] in
+            guard let self else { return }
+            self.mutedPlayback = false
+            self.wallClockAnchor = nil
+        }
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            work()
+        } else {
+            queue.async(execute: work)
+        }
+    }
+
+    public var currentMediaTime: CMTime {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            return currentMediaTimeOnQueue()
+        }
+        return queue.sync { currentMediaTimeOnQueue() }
+    }
+
+    public func seekMediaTime(_ time: CMTime) {
+        let work = { [weak self] in
+            guard let self else { return }
+            do {
+                try self.startReader(at: time)
+            } catch {
+                Log.capture.error("video seek failed: \(error.localizedDescription)")
+            }
+        }
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            work()
+        } else {
+            queue.async(execute: work)
+        }
     }
 
     public func updateCrop(_ crop: VideoCropBox) {
@@ -92,6 +185,7 @@ public final class VideoFrameSource: @unchecked Sendable {
         var loadedTrack: AVAssetTrack?
         var loadedSize: CGSize?
         var loadedDuration: CMTime?
+        var loadedSourceFps: Float = 30
         var loadError: Error?
         Task {
             do {
@@ -102,9 +196,13 @@ public final class VideoFrameSource: @unchecked Sendable {
                 let size = try await first.load(.naturalSize)
                 let transform = try await first.load(.preferredTransform)
                 let duration = try await asset.load(.duration)
+                let nominalFps = try await first.load(.nominalFrameRate)
                 loadedTrack = first
                 loadedSize = size.applying(transform).absSize
                 loadedDuration = duration
+                if nominalFps > 1 {
+                    loadedSourceFps = nominalFps
+                }
             } catch {
                 loadError = error
             }
@@ -120,12 +218,26 @@ public final class VideoFrameSource: @unchecked Sendable {
         self.track = loadedTrack
         self.videoSize = loadedSize
         self.assetDuration = loadedDuration ?? .zero
+        self.sourceFps = loadedSourceFps
         if videoSize.width <= 0 || videoSize.height <= 0 {
             throw NSError(domain: "VideoFrameSource", code: 3)
         }
+        self.decodeSize = computeDecodeSize(videoSize: loadedSize, target: decodeTarget)
     }
 
-    private func startReader() throws {
+    private func computeDecodeSize(videoSize: CGSize, target: OutputResolution?) -> CGSize {
+        guard let target else { return videoSize }
+        let ledMax = max(target.width, target.height)
+        let desired = max(64, min(720, ledMax * 4))
+        let longEdge = max(videoSize.width, videoSize.height)
+        if longEdge <= CGFloat(desired) { return videoSize }
+        let scale = CGFloat(desired) / longEdge
+        let w = max(2, Int((videoSize.width * scale).rounded()))
+        let h = max(2, Int((videoSize.height * scale).rounded()))
+        return CGSize(width: w & ~1, height: h & ~1)
+    }
+
+    private func startReader(at mediaTime: CMTime? = nil) throws {
         guard let track else {
             throw NSError(domain: "VideoFrameSource", code: 4)
         }
@@ -134,15 +246,28 @@ public final class VideoFrameSource: @unchecked Sendable {
         lock.unlock()
         let reader = try AVAssetReader(asset: asset)
         let totalSec = CMTimeGetSeconds(assetDuration)
+        let timescale = assetDuration.timescale > 0 ? assetDuration.timescale : 600
+        let rangeStart = CMTime(seconds: totalSec * activeRange.start, preferredTimescale: timescale)
+        let rangeEnd = CMTime(seconds: totalSec * activeRange.end, preferredTimescale: timescale)
+        let startTime = mediaTime ?? rangeStart
+        let clampedStart = CMTimeMaximum(rangeStart, CMTimeMinimum(startTime, rangeEnd))
+        rangeStartSeconds = CMTimeGetSeconds(clampedStart)
         if totalSec.isFinite, totalSec > 0 {
-            let timescale = assetDuration.timescale > 0 ? assetDuration.timescale : 600
-            let startTime = CMTime(seconds: totalSec * activeRange.start, preferredTimescale: timescale)
-            let span = CMTime(seconds: max(0.001, totalSec * (activeRange.end - activeRange.start)), preferredTimescale: timescale)
-            reader.timeRange = CMTimeRange(start: startTime, duration: span)
+            let span = CMTimeSubtract(rangeEnd, clampedStart)
+            reader.timeRange = CMTimeRange(
+                start: clampedStart,
+                duration: CMTime(seconds: max(0.001, CMTimeGetSeconds(span)), preferredTimescale: timescale)
+            )
         }
-        let settings: [String: Any] = [
+        var settings: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
         ]
+        if decodeSize.width > 0, decodeSize.height > 0,
+           decodeSize != videoSize {
+            settings[kCVPixelBufferWidthKey as String] = Int(decodeSize.width)
+            settings[kCVPixelBufferHeightKey as String] = Int(decodeSize.height)
+        }
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
         output.alwaysCopiesSampleData = false
         guard reader.canAdd(output) else {
@@ -156,6 +281,9 @@ public final class VideoFrameSource: @unchecked Sendable {
         self.reader?.cancelReading()
         self.reader = reader
         self.output = output
+        self.heldSample = nil
+        self.pendingSample = nil
+        self.wallClockStart = CFAbsoluteTimeGetCurrent()
         lock.unlock()
     }
 
@@ -183,10 +311,101 @@ public final class VideoFrameSource: @unchecked Sendable {
     }
 
     private func tick() {
-        guard let sampleBuffer = nextSampleBuffer() else {
+        guard let sampleBuffer = sampleForCurrentTime() else {
+            if loop, restartReaderIfNeeded(), let retry = sampleForCurrentTime() {
+                emit(retry)
+                return
+            }
             stop()
             return
         }
+        emit(sampleBuffer)
+    }
+
+    private func sampleForCurrentTime() -> CMSampleBuffer? {
+        let target = currentMediaTimeOnQueue()
+        if needsReaderReset(for: target) {
+            do {
+                try startReader(at: target)
+            } catch {
+                return heldSample
+            }
+        }
+        lock.lock()
+        let output = self.output
+        var best = heldSample
+        lock.unlock()
+        guard let output else { return best }
+
+        while true {
+            let sample: CMSampleBuffer?
+            lock.lock()
+            if let pending = pendingSample {
+                pendingSample = nil
+                sample = pending
+            } else {
+                sample = output.copyNextSampleBuffer()
+            }
+            lock.unlock()
+
+            guard let sample else {
+                lock.lock()
+                heldSample = nil
+                pendingSample = nil
+                lock.unlock()
+                guard restartReaderIfNeeded() else { return best }
+                lock.lock()
+                best = heldSample
+                lock.unlock()
+                continue
+            }
+
+            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+            if CMTimeCompare(pts, target) <= 0 {
+                best = sample
+                lock.lock()
+                heldSample = sample
+                lock.unlock()
+                continue
+            }
+            lock.lock()
+            pendingSample = sample
+            lock.unlock()
+            return best ?? sample
+        }
+    }
+
+    private func needsReaderReset(for target: CMTime) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let heldSample else { return false }
+        let heldPTS = CMSampleBufferGetPresentationTimeStamp(heldSample)
+        return CMTimeCompare(target, heldPTS) < 0
+    }
+
+    private func currentMediaTimeOnQueue() -> CMTime {
+        lock.lock()
+        let muted = mutedPlayback
+        let anchor = wallClockAnchor
+        let rate = playbackRate
+        let start = wallClockStart
+        let rangeStart = rangeStartSeconds
+        lock.unlock()
+
+        if muted, let anchor {
+            let elapsed = max(0, CFAbsoluteTimeGetCurrent() - anchor.wall)
+            let seconds = CMTimeGetSeconds(anchor.media) + Double(rate) * elapsed
+            return CMTime(seconds: seconds, preferredTimescale: 600)
+        }
+        if let playbackClock {
+            return playbackClock()
+        }
+        guard let start else { return .zero }
+        let elapsed = max(0, CFAbsoluteTimeGetCurrent() - start)
+        return CMTime(seconds: rangeStart + Double(rate) * elapsed, preferredTimescale: 600)
+    }
+
+    private func emit(_ sampleBuffer: CMSampleBuffer) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         onPreviewBuffer?(pixelBuffer)
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
@@ -204,22 +423,6 @@ public final class VideoFrameSource: @unchecked Sendable {
             rowBytes: bytesPerRow
         )
         onFrameBGRA?(buffer)
-    }
-
-    private func nextSampleBuffer() -> CMSampleBuffer? {
-        lock.lock()
-        let output = self.output
-        lock.unlock()
-        if let sample = output?.copyNextSampleBuffer() {
-            return sample
-        }
-        guard restartReaderIfNeeded() else {
-            return nil
-        }
-        lock.lock()
-        let restartedOutput = self.output
-        lock.unlock()
-        return restartedOutput?.copyNextSampleBuffer()
     }
 
     private func normalizedCrop(forWidth width: Int, height: Int) -> (x: Int, y: Int, width: Int, height: Int) {

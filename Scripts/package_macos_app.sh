@@ -44,8 +44,6 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <string>${BUILD_NUMBER:-1}</string>
     <key>CFBundleIconFile</key>
     <string>WledCast.icns</string>
-    <key>LSUIElement</key>
-    <true/>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>

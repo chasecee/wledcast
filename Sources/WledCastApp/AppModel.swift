@@ -30,10 +30,13 @@ final class AppModel: ObservableObject {
     @Published var loopVideo = true
     @Published var loopRange: LoopRange = .full
     @Published var overlayMosaicEnabled = true
-    @Published var fps: Int = 30
+    @Published private(set) var fps: Int = WLEDHost.defaultFps
+    @Published private(set) var targetFps: Int = WLEDHost.defaultFps
     @Published var aspectLock = true
     @Published var isStreaming = false
     @Published var senderState: DDPSenderState = .stopped
+    @Published var audioVolume: Double = 1.0
+    @Published var audioMuted: Bool = false
 
     private let discovery = WLEDDiscoveryClient()
     private var discoveryTask: Task<Void, Never>?
@@ -42,29 +45,40 @@ final class AppModel: ObservableObject {
     private var source: DisplayFrameSource?
     private var videoSource: VideoFrameSource?
     private var videoPreviewSource: VideoFrameSource?
+    private var audioPlayer: VideoAudioPlayer?
     private var overlay: OverlayWindowController?
     private var boxRef: CaptureBoxRef?
-    private var lastMosaicImage: NSImage?
-    private var lastPreviewUpdate: Date = .distantPast
-    private let previewMinInterval: TimeInterval = 0.1
+    private var lastMosaicImage: CGImage?
     private var scrubGenerator: AVAssetImageGenerator?
     private var scrubAssetURL: URL?
     private var scrubAssetDuration: CMTime = .zero
+    private var streamingSourceFps: Float = 30
+    private var isLoopScrubbing = false
 
     private let defaults = UserDefaults.standard
+    private let videoSettingsStore = VideoSettingsStore()
     private let youtubeDownloader = YouTubeDownloader()
     private var fetchTask: Task<Void, Never>?
 
     init() {
         restore()
+        migrateLegacyVideoSettings()
         refreshVideoLibrary()
+        applyVideoSettings(for: selectedVideo)
         startDiscovery()
         if !selectedHost.isEmpty {
-            refreshSelectedHostResolution()
+            refreshSelectedHostProfile()
         }
         Task { @MainActor [weak self] in
             self?.autoStart()
         }
+    }
+
+    var wledFpsLabel: String {
+        if targetFps == 0 {
+            return "Unlimited"
+        }
+        return "\(fps) fps"
     }
 
     private func autoStart() {
@@ -80,7 +94,11 @@ final class AppModel: ObservableObject {
         overlay?.window?.isVisible == true
     }
 
-    private var canStartStreaming: Bool {
+    var isWindowVisible: Bool {
+        isOverlayVisible
+    }
+
+    var canStartStreaming: Bool {
         guard !selectedHost.isEmpty, outputResolution != nil else { return false }
         if captureMode == .video {
             return selectedVideo != nil
@@ -92,31 +110,63 @@ final class AppModel: ObservableObject {
         hosts.contains { $0.host == selectedHost }
     }
 
-    private func refreshSelectedHostResolution() {
+    private func refreshSelectedHostProfile() {
         let host = selectedHost
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let resolution = try await self.discovery.fetchMatrixResolution(host: host)
+                let profile = try await self.discovery.fetchHostProfile(host: host)
                 guard self.selectedHost == host else { return }
-                await self.discovery.inject(host: host, resolution: resolution)
-                let previous = self.outputResolution
-                if previous != resolution {
-                    self.outputResolution = resolution
-                    self.overlay?.outputResolution = resolution
-                    self.persist()
-                    if self.isStreaming {
-                        self.restartStreaming()
-                    } else {
-                        self.autoStart()
-                    }
-                } else {
-                    self.autoStart()
-                }
+                await self.discovery.inject(host: host, profile: profile)
+                self.applyHostProfile(profile, restartIfStreaming: true)
             } catch {
-                Log.app.warning("failed to fetch matrix for \(host): \(error.localizedDescription)")
+                Log.app.warning("failed to fetch WLED profile for \(host): \(error.localizedDescription)")
             }
         }
+    }
+
+    private func applyHostProfile(_ profile: WLEDHostProfile, restartIfStreaming: Bool) {
+        let previousResolution = outputResolution
+        let previousFps = fps
+        targetFps = profile.targetFps
+        outputResolution = profile.resolution
+        overlay?.outputResolution = profile.resolution
+        applyEffectiveFps(profile.effectiveFps)
+        persist()
+        if isStreaming {
+            if outputResolution != previousResolution && fps == previousFps {
+                restartStreaming()
+            }
+            return
+        }
+        guard restartIfStreaming || outputResolution != previousResolution || fps != previousFps else { return }
+        autoStart()
+    }
+
+    private func applyEffectiveFps(_ value: Int) {
+        let next = max(1, value)
+        guard fps != next else { return }
+        fps = next
+        if isStreaming {
+            restartStreaming()
+            return
+        }
+        if captureMode == .video {
+            let rate = VideoAudioPlayer.playbackRate(sourceFps: streamingSourceFps, outputFps: next)
+            videoSource?.setPlaybackRate(rate)
+            videoPreviewSource?.setPlaybackRate(rate)
+            audioPlayer?.updateOutputFps(next, sourceFps: streamingSourceFps)
+            videoSource?.setOutputFps(next)
+            videoPreviewSource?.setOutputFps(next)
+        }
+    }
+
+    private func syncFpsFromSelectedHost() {
+        guard let host = hosts.first(where: { $0.host.caseInsensitiveCompare(selectedHost) == .orderedSame }) else {
+            return
+        }
+        targetFps = host.targetFps
+        applyEffectiveFps(host.effectiveFps)
     }
 
     func quit() {
@@ -128,17 +178,19 @@ final class AppModel: ObservableObject {
         let hostChanged = host != selectedHost
         selectedHost = host
         if let info = hosts.first(where: { $0.host == host }) {
-            outputResolution = info.resolution
-            overlay?.outputResolution = info.resolution
+            applyHostProfile(
+                WLEDHostProfile(resolution: info.resolution, targetFps: info.targetFps),
+                restartIfStreaming: hostChanged
+            )
         } else {
             outputResolution = nil
-        }
-        persist()
-        guard hostChanged else { return }
-        if isStreaming {
-            restartStreaming()
-        } else {
-            autoStart()
+            persist()
+            guard hostChanged else { return }
+            if isStreaming {
+                restartStreaming()
+            } else {
+                autoStart()
+            }
         }
     }
 
@@ -163,17 +215,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func setFPS(_ value: Int) {
-        fps = max(1, value)
-        persist()
-        if captureMode == .video {
-            videoSource?.setOutputFps(fps)
-            videoPreviewSource?.setOutputFps(fps)
-        } else if isStreaming {
-            restartStreaming()
-        }
-    }
-
     func setAspectLock(_ value: Bool) {
         aspectLock = value
         overlay?.aspectLock = value
@@ -182,8 +223,10 @@ final class AppModel: ObservableObject {
 
     func setOverlayMosaicEnabled(_ value: Bool) {
         overlayMosaicEnabled = value
-        if value, let lastMosaicImage {
-            overlay?.mosaicImage = lastMosaicImage
+        if value {
+            overlay?.mosaicHolder.set(lastMosaicImage)
+        } else {
+            overlay?.mosaicHolder.set(nil)
         }
         syncOverlayVisualizationSettings()
         persist()
@@ -194,12 +237,41 @@ final class AppModel: ObservableObject {
         scrubGenerator = nil
         scrubAssetURL = nil
         scrubAssetDuration = .zero
-        loopRange = .full
+        applyVideoSettings(for: url)
         persist()
         refreshVideoPreviewIfNeeded()
         if isStreaming, captureMode == .video {
             restartStreaming()
         }
+    }
+
+    func setAudioVolume(_ value: Double) {
+        audioVolume = max(0, min(1, value))
+        audioPlayer?.setVolume(Float(audioVolume))
+        persist()
+    }
+
+    func setAudioMuted(_ value: Bool) {
+        guard audioMuted != value else { return }
+        audioMuted = value
+        persist()
+
+        if captureMode == .video, isStreaming, let videoSource, let audioPlayer {
+            if value {
+                let time = audioPlayer.playbackTime
+                videoSource.beginMutedPlayback(at: time)
+                audioPlayer.pauseForMute()
+                audioPlayer.setMuted(true)
+            } else {
+                let time = videoSource.currentMediaTime
+                videoSource.endMutedPlayback()
+                videoSource.seekMediaTime(time)
+                audioPlayer.syncTo(time: time)
+                audioPlayer.setMuted(false)
+            }
+            return
+        }
+        audioPlayer?.setMuted(value)
     }
 
     func setLoopVideo(_ value: Bool) {
@@ -223,6 +295,8 @@ final class AppModel: ObservableObject {
         } else if self.selectedVideo == nil {
             self.selectedVideo = videoLibrary.first
         }
+        videoSettingsStore.prune(keeping: videoLibrary)
+        applyVideoSettings(for: selectedVideo)
     }
 
     func fetchYouTube() {
@@ -325,7 +399,7 @@ final class AppModel: ObservableObject {
                 self.videoCropBox = crop
                 self.videoSource?.updateCrop(crop)
                 self.videoPreviewSource?.updateCrop(crop)
-                self.persist()
+                self.saveCurrentVideoSettings()
             }
         }
         overlay = controller
@@ -347,6 +421,7 @@ final class AppModel: ObservableObject {
     func startStreaming() {
         guard !isStreaming else { return }
         guard !selectedHost.isEmpty else { return }
+        syncFpsFromSelectedHost()
         guard let resolution = outputResolution else { return }
         if captureMode == .region, !ensureScreenPermission() { return }
         ensureOverlayVisible()
@@ -379,19 +454,29 @@ final class AppModel: ObservableObject {
                     refreshVideoPreviewIfNeeded()
                     return
                 }
+                let sourceFps = VideoFrameSource.loadSourceFps(url: selectedVideo)
+                streamingSourceFps = sourceFps
+                let playbackRate = VideoAudioPlayer.playbackRate(sourceFps: sourceFps, outputFps: fps)
+                startAudioPlayer(url: selectedVideo, outputFps: fps, sourceFps: sourceFps)
                 let videoSource = try VideoFrameSource(
                     url: selectedVideo,
                     fps: fps,
                     crop: videoCropBox,
                     loop: loopVideo,
-                    loopRange: loopRange
+                    loopRange: loopRange,
+                    decodeTarget: resolution,
+                    playbackClock: { [weak self] in
+                        self?.audioPlayer?.playbackTime ?? .zero
+                    }
                 )
+                videoSource.setPlaybackRate(playbackRate)
                 videoSource.onFrameBGRA = { [weak controller] buffer in
                     controller?.process(bgra: buffer)
                 }
                 videoSource.onPreviewBuffer = { [weak self] buffer in
                     Task { @MainActor in
-                        self?.overlay?.setPreviewBuffer(buffer)
+                        guard let self, !self.isLoopScrubbing else { return }
+                        self.overlay?.setPreviewBuffer(buffer)
                     }
                 }
                 stopVideoPreview()
@@ -437,13 +522,16 @@ final class AppModel: ObservableObject {
         source = nil
         videoSource?.stop()
         videoSource = nil
+        audioPlayer?.stop()
+        audioPlayer = nil
         boxRef = nil
         session?.stop()
         session = nil
         sender?.stop()
         sender = nil
         isStreaming = false
-        overlay?.mosaicImage = nil
+        lastMosaicImage = nil
+        overlay?.mosaicHolder.set(nil)
         refreshVideoPreviewIfNeeded()
     }
 
@@ -456,21 +544,19 @@ final class AppModel: ObservableObject {
             for await discovered in stream {
                 await MainActor.run {
                     self.hosts = discovered
-                    let previous = self.outputResolution
                     if self.selectedHost.isEmpty, let first = discovered.first {
                         self.selectedHost = first.host
-                        self.outputResolution = first.resolution
-                    } else if let selected = discovered.first(where: { $0.host == self.selectedHost }) {
-                        self.outputResolution = selected.resolution
-                    }
-                    if let resolution = self.outputResolution {
-                        self.overlay?.outputResolution = resolution
-                    }
-                    self.persist()
-                    if self.isStreaming, self.outputResolution != previous {
-                        self.restartStreaming()
-                    } else {
-                        self.autoStart()
+                        self.applyHostProfile(
+                            WLEDHostProfile(resolution: first.resolution, targetFps: first.targetFps),
+                            restartIfStreaming: true
+                        )
+                    } else if let selected = discovered.first(where: {
+                        $0.host.caseInsensitiveCompare(self.selectedHost) == .orderedSame
+                    }) {
+                        self.applyHostProfile(
+                            WLEDHostProfile(resolution: selected.resolution, targetFps: selected.targetFps),
+                            restartIfStreaming: true
+                        )
                     }
                 }
             }
@@ -500,15 +586,13 @@ final class AppModel: ObservableObject {
 
     private func persist() {
         defaults.set(selectedHost, forKey: "lastHost")
-        defaults.set(fps, forKey: "fps")
         defaults.set(aspectLock, forKey: "aspectLock")
         defaults.set(captureMode.rawValue, forKey: "captureMode")
         defaults.set(selectedVideo?.path, forKey: "selectedVideoPath")
         defaults.set(loopVideo, forKey: "loopVideo")
         defaults.set(overlayMosaicEnabled, forKey: "overlayMosaicEnabled")
-        if let loopData = try? JSONEncoder().encode(loopRange) {
-            defaults.set(loopData, forKey: "loopRange")
-        }
+        defaults.set(audioVolume, forKey: "audioVolume")
+        defaults.set(audioMuted, forKey: "audioMuted")
         if let resolution = outputResolution, let data = try? JSONEncoder().encode(resolution) {
             defaults.set(data, forKey: "outputResolution")
         }
@@ -519,15 +603,10 @@ final class AppModel: ObservableObject {
         if let boxData = try? JSONEncoder().encode(captureBox) {
             defaults.set(boxData, forKey: "captureBox")
         }
-        if let cropData = try? JSONEncoder().encode(videoCropBox) {
-            defaults.set(cropData, forKey: "videoCropBox")
-        }
     }
 
     private func restore() {
         selectedHost = defaults.string(forKey: "lastHost") ?? ""
-        fps = max(1, defaults.integer(forKey: "fps"))
-        if fps == 0 { fps = 30 }
         aspectLock = defaults.object(forKey: "aspectLock") as? Bool ?? true
         if let modeRaw = defaults.string(forKey: "captureMode"),
            let mode = CaptureMode(rawValue: modeRaw) {
@@ -548,19 +627,55 @@ final class AppModel: ObservableObject {
            let decodedBox = try? JSONDecoder().decode(CaptureBox.self, from: boxData) {
             captureBox = decodedBox
         }
-        if let cropData = defaults.data(forKey: "videoCropBox"),
-           let decodedCrop = try? JSONDecoder().decode(VideoCropBox.self, from: cropData) {
-            videoCropBox = decodedCrop
-        }
         loopVideo = defaults.object(forKey: "loopVideo") as? Bool ?? true
         overlayMosaicEnabled = defaults.object(forKey: "overlayMosaicEnabled") as? Bool ?? true
+        audioVolume = min(1, max(0, defaults.object(forKey: "audioVolume") as? Double ?? 1.0))
+        audioMuted = defaults.object(forKey: "audioMuted") as? Bool ?? false
         if let path = defaults.string(forKey: "selectedVideoPath"), !path.isEmpty {
             selectedVideo = URL(fileURLWithPath: path)
         }
-        if let loopData = defaults.data(forKey: "loopRange"),
-           let decodedLoop = try? JSONDecoder().decode(LoopRange.self, from: loopData) {
-            loopRange = decodedLoop.clamped()
+    }
+
+    private func applyVideoSettings(for url: URL?) {
+        guard let url else {
+            videoCropBox = .full
+            loopRange = .full
+            overlay?.setVideoCrop(.full)
+            return
         }
+        let settings = videoSettingsStore.settings(for: url)
+        videoCropBox = settings.crop
+        loopRange = settings.loopRange.clamped()
+        overlay?.setVideoCrop(videoCropBox)
+    }
+
+    private func saveCurrentVideoSettings() {
+        guard let selectedVideo else { return }
+        videoSettingsStore.save(
+            VideoSettings(crop: videoCropBox, loopRange: loopRange.clamped()),
+            for: selectedVideo
+        )
+    }
+
+    private func migrateLegacyVideoSettings() {
+        guard let selectedVideo else { return }
+        var settings = videoSettingsStore.settings(for: selectedVideo)
+        var migrated = false
+
+        if let cropData = defaults.data(forKey: "videoCropBox"),
+           let crop = try? JSONDecoder().decode(VideoCropBox.self, from: cropData) {
+            settings.crop = crop
+            migrated = true
+            defaults.removeObject(forKey: "videoCropBox")
+        }
+        if let loopData = defaults.data(forKey: "loopRange"),
+           let loop = try? JSONDecoder().decode(LoopRange.self, from: loopData) {
+            settings.loopRange = loop.clamped()
+            migrated = true
+            defaults.removeObject(forKey: "loopRange")
+        }
+        guard migrated else { return }
+        videoSettingsStore.save(settings, for: selectedVideo)
     }
 
     private func videoDirectoryURL() -> URL {
@@ -608,16 +723,31 @@ final class AppModel: ObservableObject {
     }
 
     private func updatePreview(_ frame: RGBFrame) {
-        let now = Date()
-        guard now.timeIntervalSince(lastPreviewUpdate) >= previewMinInterval else { return }
-        lastPreviewUpdate = now
-        let image = makePreviewImage(frame)
+        guard let image = makePreviewCGImage(frame) else { return }
         lastMosaicImage = image
-        overlay?.mosaicImage = image
+        overlay?.mosaicHolder.set(image)
     }
 
     private func syncOverlayVisualizationSettings() {
         overlay?.mosaicEnabled = overlayMosaicEnabled
+    }
+
+    private func startAudioPlayer(url: URL, outputFps: Int, sourceFps: Float) {
+        audioPlayer?.stop()
+        audioPlayer = nil
+        do {
+            audioPlayer = try VideoAudioPlayer(
+                url: url,
+                loop: loopVideo,
+                loopRange: loopRange,
+                volume: Float(audioVolume),
+                muted: audioMuted,
+                sourceFps: sourceFps,
+                outputFps: outputFps
+            )
+        } catch {
+            audioPlayer = nil
+        }
     }
 
     private func stopVideoPreview() {
@@ -645,16 +775,22 @@ final class AppModel: ObservableObject {
 
         stopVideoPreview()
         do {
+            let sourceFps = streamingSourceFps > 1 ? streamingSourceFps : VideoFrameSource.loadSourceFps(url: selectedVideo)
+            streamingSourceFps = sourceFps
+            let playbackRate = VideoAudioPlayer.playbackRate(sourceFps: sourceFps, outputFps: fps)
             let preview = try VideoFrameSource(
                 url: selectedVideo,
                 fps: fps,
                 crop: videoCropBox,
                 loop: loopVideo,
-                loopRange: loopRange
+                loopRange: loopRange,
+                decodeTarget: outputResolution
             )
+            preview.setPlaybackRate(playbackRate)
             preview.onPreviewBuffer = { [weak self] buffer in
                 Task { @MainActor in
-                    self?.overlay?.setPreviewBuffer(buffer)
+                    guard let self, !self.isLoopScrubbing else { return }
+                    self.overlay?.setPreviewBuffer(buffer)
                 }
             }
             videoPreviewSource = preview
@@ -664,10 +800,16 @@ final class AppModel: ObservableObject {
     }
 
     func beginLoopScrub() {
+        isLoopScrubbing = true
+        overlay?.loopScrubbing = true
         videoPreviewSource?.stop()
         videoPreviewSource = nil
-        videoSource?.stop()
-        videoSource = nil
+        if isStreaming, captureMode == .video {
+            audioPlayer?.pauseForScrub()
+        } else {
+            videoSource?.stop()
+            videoSource = nil
+        }
         guard let selectedVideo else { return }
         if scrubAssetURL != selectedVideo {
             let asset = AVAsset(url: selectedVideo)
@@ -689,36 +831,49 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func scrubLoopRange(toRatio ratio: Double) {
+    func scrubLoopRange(handle: LoopScrubHandle, ratio: Double) {
         guard let generator = scrubGenerator else { return }
         let totalSec = CMTimeGetSeconds(scrubAssetDuration)
         guard totalSec.isFinite, totalSec > 0 else { return }
         let clamped = max(0, min(1, ratio))
-        let time = CMTime(seconds: totalSec * clamped, preferredTimescale: 600)
+        let seekSec: Double
+        switch handle {
+        case .start:
+            seekSec = totalSec * clamped
+        case .end:
+            let endSec = totalSec * clamped
+            let floorSec = totalSec * loopRange.start
+            seekSec = max(floorSec, endSec - 2.0)
+        }
+        let time = CMTime(seconds: seekSec, preferredTimescale: 600)
         generator.generateCGImageAsynchronously(for: time) { [weak self] cgImage, _, _ in
             guard let self, let cgImage else { return }
             let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
             Task { @MainActor in
+                guard self.isLoopScrubbing else { return }
                 self.overlay?.setPreviewImage(image)
             }
         }
     }
 
     func commitLoopRange(_ range: LoopRange) {
+        isLoopScrubbing = false
+        overlay?.loopScrubbing = false
         let clamped = range.clamped()
         let changed = loopRange != clamped
         loopRange = clamped
-        persist()
+        saveCurrentVideoSettings()
         if isStreaming, captureMode == .video {
-            restartStreaming()
+            videoSource?.updateLoopRange(clamped)
+            audioPlayer?.updateLoopRange(clamped)
         } else if changed || captureMode == .video {
             refreshVideoPreviewIfNeeded()
         }
     }
 
-    private func makePreviewImage(_ frame: RGBFrame) -> NSImage? {
+    private func makePreviewCGImage(_ frame: RGBFrame) -> CGImage? {
         guard let provider = CGDataProvider(data: Data(frame.pixels) as CFData) else { return nil }
-        guard let cgImage = CGImage(
+        return CGImage(
             width: frame.width,
             height: frame.height,
             bitsPerComponent: 8,
@@ -730,9 +885,6 @@ final class AppModel: ObservableObject {
             decode: nil,
             shouldInterpolate: false,
             intent: .defaultIntent
-        ) else {
-            return nil
-        }
-        return NSImage(cgImage: cgImage, size: NSSize(width: frame.width, height: frame.height))
+        )
     }
 }

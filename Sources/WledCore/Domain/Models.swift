@@ -155,14 +155,36 @@ public struct CaptureSelection: Codable, Equatable, Sendable {
     }
 }
 
+public struct WLEDHostProfile: Equatable, Sendable {
+    public let resolution: OutputResolution
+    public let targetFps: Int
+
+    public init(resolution: OutputResolution, targetFps: Int) {
+        self.resolution = resolution
+        self.targetFps = targetFps
+    }
+
+    public var effectiveFps: Int {
+        targetFps > 0 ? targetFps : WLEDHost.defaultFps
+    }
+}
+
 public struct WLEDHost: Codable, Equatable, Sendable, Identifiable {
+    public static let defaultFps = 42
+
     public let host: String
     public let resolution: OutputResolution
+    public let targetFps: Int
 
     public var id: String { host }
 
-    public init(host: String, resolution: OutputResolution) {
+    public var effectiveFps: Int {
+        targetFps > 0 ? targetFps : Self.defaultFps
+    }
+
+    public init(host: String, resolution: OutputResolution, targetFps: Int = Self.defaultFps) {
         self.host = host
         self.resolution = resolution
+        self.targetFps = targetFps
     }
 }
