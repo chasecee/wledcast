@@ -1,3 +1,4 @@
+import Accelerate
 import AppKit
 import CoreMedia
 import CoreVideo
@@ -31,7 +32,7 @@ public final class DisplayFrameSource {
         public var deliveredFrames: Int
     }
 
-    public var onFrame: ((RGBFrame) -> Void)?
+    public var onFrameBGRA: ((vImage_Buffer) -> Void)?
     public var onDiagnostics: ((Diagnostics) -> Void)?
 
     private let boxRef: CaptureBoxRef
@@ -44,10 +45,9 @@ public final class DisplayFrameSource {
     private var streamConfiguration: SCStreamConfiguration?
     private let queue = DispatchQueue(label: "wledcast.capture.output", qos: .userInteractive)
     private var activeDisplayID: CGDirectDisplayID = 0
-    private var rgbScratch: [UInt8]
+    private var activeSourcePixels: (width: Int, height: Int) = (1, 1)
     private var deliveredFrames = 0
     private var lastDiagnosticsAt = Date.distantPast
-    private let maxCaptureDimension = 4096
 
     public init(
         boxRef: CaptureBoxRef,
@@ -61,7 +61,6 @@ public final class DisplayFrameSource {
         self.fps = max(1, fps)
         self.captureSelection = captureSelection
         self.excludedWindowIDs = excludedWindowIDs
-        self.rgbScratch = [UInt8](repeating: 0, count: max(1, outputResolution.width * outputResolution.height * 3))
         streamOutput.onSampleBuffer = { [weak self] sampleBuffer in
             self?.consume(sampleBuffer: sampleBuffer)
         }
@@ -80,10 +79,16 @@ public final class DisplayFrameSource {
         guard captureSelection.mode == .region else { return }
         guard box.displayID == activeDisplayID else { return }
         guard let stream, let configuration = streamConfiguration else { return }
+        let scale = backingScale(for: activeDisplayID)
+        let sourcePixels = (
+            width: max(1, Int((CGFloat(max(1, box.width)) * scale).rounded())),
+            height: max(1, Int((CGFloat(max(1, box.height)) * scale).rounded()))
+        )
+        activeSourcePixels = sourcePixels
         configuration.sourceRect = sourceRect(for: box)
-        let captureSize = captureSize(for: .region, displayID: activeDisplayID, box: box)
-        configuration.width = captureSize.width
-        configuration.height = captureSize.height
+        let target = captureSize(sourcePixels: sourcePixels)
+        configuration.width = target.width
+        configuration.height = target.height
         Task {
             try? await stream.updateConfiguration(configuration)
         }
@@ -101,27 +106,28 @@ public final class DisplayFrameSource {
     private func startStream() async throws {
         let content = try await SCShareableContent.current
         let (filter, displayID) = try buildFilter(content: content)
-        let captureSize = captureSize(
-            for: captureSelection.mode,
-            displayID: displayID,
-            box: boxRef.box
+        let scale = backingScale(for: displayID)
+        let box = boxRef.box
+        let sourcePixels = (
+            width: max(1, Int((CGFloat(max(1, box.width)) * scale).rounded())),
+            height: max(1, Int((CGFloat(max(1, box.height)) * scale).rounded()))
         )
+        activeSourcePixels = sourcePixels
+        let target = captureSize(sourcePixels: sourcePixels)
 
         let configuration = SCStreamConfiguration()
-        configuration.width = captureSize.width
-        configuration.height = captureSize.height
+        configuration.width = target.width
+        configuration.height = target.height
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.scalesToFit = false
         configuration.showsCursor = false
         configuration.queueDepth = 3
-        if captureSelection.mode == .region {
-            configuration.sourceRect = sourceRect(for: boxRef.box)
-        }
+        configuration.sourceRect = sourceRect(for: box)
 
         activeDisplayID = displayID
         Log.capture.notice(
-            "stream display=\(displayID) src=\(configuration.sourceRect) out=\(configuration.width)x\(configuration.height) target=\(outputResolution.width)x\(outputResolution.height) fps=\(fps)"
+            "stream display=\(displayID) src=\(configuration.sourceRect) sourcePx=\(sourcePixels.width)x\(sourcePixels.height) out=\(target.width)x\(target.height) target=\(outputResolution.width)x\(outputResolution.height) fps=\(fps)"
         )
 
         let newStream = SCStream(filter: filter, configuration: configuration, delegate: nil)
@@ -132,86 +138,62 @@ public final class DisplayFrameSource {
     }
 
     private func buildFilter(content: SCShareableContent) throws -> (SCContentFilter, CGDirectDisplayID) {
-        switch captureSelection.mode {
-        case .video:
-            throw NSError(domain: "DisplayFrameSource", code: 7)
-        case .region:
-            let display: SCDisplay?
-            if let displayID = captureSelection.displayID {
-                display = content.displays.first(where: { $0.displayID == displayID })
-            } else {
-                let mainID = CGMainDisplayID()
-                display = content.displays.first(where: { $0.displayID == mainID }) ?? content.displays.first
-            }
-            guard let display else {
-                throw NSError(domain: "DisplayFrameSource", code: 3)
-            }
-            let excluded = content.windows.filter { excludedWindowIDs.contains($0.windowID) }
-            return (SCContentFilter(display: display, excludingWindows: excluded), display.displayID)
+        let display: SCDisplay?
+        if let displayID = captureSelection.displayID {
+            display = content.displays.first(where: { $0.displayID == displayID })
+        } else {
+            let mainID = CGMainDisplayID()
+            display = content.displays.first(where: { $0.displayID == mainID }) ?? content.displays.first
         }
+        guard let display else {
+            throw NSError(domain: "DisplayFrameSource", code: 3)
+        }
+        let excluded = content.windows.filter { excludedWindowIDs.contains($0.windowID) }
+        return (SCContentFilter(display: display, excludingWindows: excluded), display.displayID)
     }
 
-    private func captureSize(
-        for mode: CaptureMode,
-        displayID: CGDirectDisplayID,
-        box: CaptureBox
-    ) -> (width: Int, height: Int) {
-        switch mode {
-        case .video:
-            return clampCaptureSize(width: outputResolution.width, height: outputResolution.height)
-        case .region:
-            let scale = backingScale(for: displayID)
-            return clampCaptureSize(
-                width: Int((CGFloat(max(1, box.width)) * scale).rounded()),
-                height: Int((CGFloat(max(1, box.height)) * scale).rounded())
-            )
-        }
+    private func captureSize(sourcePixels: (width: Int, height: Int)) -> (width: Int, height: Int) {
+        let oversample = pickOversample(sourcePixels: sourcePixels)
+        let width = max(outputResolution.width, outputResolution.width * oversample)
+        let height = max(outputResolution.height, outputResolution.height * oversample)
+        return (
+            width: min(sourcePixels.width, width),
+            height: min(sourcePixels.height, height)
+        )
+    }
+
+    private func pickOversample(sourcePixels: (width: Int, height: Int)) -> Int {
+        let xCap = sourcePixels.width / max(1, outputResolution.width * 2)
+        let yCap = sourcePixels.height / max(1, outputResolution.height * 2)
+        let cap = max(1, min(xCap, yCap))
+        if cap >= 8 { return 8 }
+        if cap >= 6 { return 6 }
+        if cap >= 4 { return 4 }
+        if cap >= 3 { return 3 }
+        return 2
     }
 
     private func backingScale(for displayID: CGDirectDisplayID) -> CGFloat {
         NSScreen.screen(for: displayID)?.backingScaleFactor ?? 2.0
     }
 
-    private func clampCaptureSize(width: Int, height: Int) -> (width: Int, height: Int) {
-        (
-            width: min(maxCaptureDimension, max(1, width)),
-            height: min(maxCaptureDimension, max(1, height))
-        )
-    }
-
     private func consume(sampleBuffer: CMSampleBuffer) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-
         guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
-        let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let buffer = baseAddress.assumingMemoryBound(to: UInt8.self)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
 
-        let rgbCount = width * height * 3
-        if rgbScratch.count != rgbCount {
-            rgbScratch = [UInt8](repeating: 0, count: rgbCount)
-        }
-        rgbScratch.withUnsafeMutableBufferPointer { rgbPtr in
-            guard let dst = rgbPtr.baseAddress else { return }
-            for y in 0..<height {
-                let row = buffer.advanced(by: y * stride)
-                let outRow = dst.advanced(by: y * width * 3)
-                for x in 0..<width {
-                    let s = x * 4
-                    let d = x * 3
-                    outRow[d] = row[s + 2]
-                    outRow[d + 1] = row[s + 1]
-                    outRow[d + 2] = row[s]
-                }
-            }
-        }
-
+        let buffer = vImage_Buffer(
+            data: baseAddress,
+            height: vImagePixelCount(height),
+            width: vImagePixelCount(width),
+            rowBytes: bytesPerRow
+        )
+        onFrameBGRA?(buffer)
         deliveredFrames += 1
-        let frame = RGBFrame(width: width, height: height, pixels: rgbScratch)
-        onFrame?(frame)
         emitDiagnosticsIfDue(framePixels: CGSize(width: width, height: height))
     }
 

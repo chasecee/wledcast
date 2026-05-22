@@ -1,12 +1,14 @@
+import Accelerate
 import Foundation
 
 public final class SessionController: @unchecked Sendable {
     private let sender: DDPSender
     private let outputResolution: OutputResolution
+    private let pipeline: FramePipeline
+    private let temporalSmoother = TemporalSmoother()
     private let filterLock = NSLock()
     private var filterConfig: FilterConfig
     private var flickerFighter: Float
-    private let temporalSmoother = TemporalSmoother()
 
     public var onFrameProcessed: ((RGBFrame) -> Void)?
 
@@ -18,6 +20,7 @@ public final class SessionController: @unchecked Sendable {
     ) {
         self.sender = sender
         self.outputResolution = outputResolution
+        self.pipeline = FramePipeline(output: outputResolution)
         self.filterConfig = filterConfig
         self.flickerFighter = max(0, min(1, flickerFighter))
     }
@@ -30,25 +33,19 @@ public final class SessionController: @unchecked Sendable {
         filterLock.lock(); flickerFighter = max(0, min(1, value)); filterLock.unlock()
     }
 
-    public func process(frame: RGBFrame) {
+    public func process(bgra: vImage_Buffer) {
         filterLock.lock()
         let cfg = filterConfig
         let flicker = flickerFighter
         filterLock.unlock()
-        let processed = FramePipeline.process(frame: frame, output: outputResolution, filters: cfg)
+        let processed = pipeline.process(bgra: bgra, filters: cfg)
         let smoothed = temporalSmoother.apply(frame: processed, strength: flicker)
         onFrameProcessed?(smoothed)
         sender.send(frame: smoothed)
     }
 
     public func blackout() {
-        let payloadCount = max(1, outputResolution.width * outputResolution.height * 3)
-        let blackFrame = RGBFrame(
-            width: outputResolution.width,
-            height: outputResolution.height,
-            pixels: [UInt8](repeating: 0, count: payloadCount)
-        )
-        sender.send(frame: blackFrame)
+        sender.sendBlackout(pixelCount: outputResolution.width * outputResolution.height)
     }
 
     public func stop() {

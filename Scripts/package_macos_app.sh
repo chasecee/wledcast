@@ -16,6 +16,7 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
 swift build -c release --package-path "$ROOT_DIR"
 cp "$BUILD_DIR/$BIN_NAME" "$APP_DIR/Contents/MacOS/$BIN_NAME"
+cp -R "$ROOT_DIR/Scripts" "$APP_DIR/Contents/Resources/Scripts"
 if [[ -f "$ICON_PATH" ]]; then
   cp "$ICON_PATH" "$APP_DIR/Contents/Resources/WledCast.icns"
 fi

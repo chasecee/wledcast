@@ -81,14 +81,6 @@ The app requires Screen Recording permission to capture frames.
 
 When launched as the packaged `.app`, permissions should remain stable across releases as long as bundle id and signing identity stay constant.
 
-## Legacy Python implementation
-
-The older cross-platform Python implementation was archived under `legacy/`.
-
-- Main package: `legacy/wledcast`
-- Python project files: `legacy/pyproject.toml`, `legacy/uv.lock`
-- Older parity helper: `legacy/Scripts/generate_parity_fixtures.py`
-
 ## License
 
 GPLv3. See `LICENSE`.

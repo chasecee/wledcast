@@ -1,200 +1,174 @@
-import Foundation
 import Accelerate
+import Foundation
 
-public enum FramePipeline {
-    private struct AxisTap {
-        let sourceIndex: Int
-        let weight: Float
+public final class FramePipeline {
+    private let outputWidth: Int
+    private let outputHeight: Int
+    private let pixelCount: Int
+    private let bgraStride: Int
+
+    private let scaledBGRA: UnsafeMutablePointer<UInt8>
+    private let rgbBuffer: UnsafeMutablePointer<UInt8>
+    private let sharpenBuffer: UnsafeMutablePointer<UInt8>
+
+    public init(output: OutputResolution) {
+        self.outputWidth = max(1, output.width)
+        self.outputHeight = max(1, output.height)
+        self.pixelCount = outputWidth * outputHeight
+        self.bgraStride = outputWidth * 4
+        self.scaledBGRA = UnsafeMutablePointer<UInt8>.allocate(capacity: pixelCount * 4)
+        self.rgbBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: pixelCount * 3)
+        self.sharpenBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: pixelCount * 3)
+        scaledBGRA.initialize(repeating: 0, count: pixelCount * 4)
+        rgbBuffer.initialize(repeating: 0, count: pixelCount * 3)
+        sharpenBuffer.initialize(repeating: 0, count: pixelCount * 3)
     }
 
-    public static func process(
-        frame: RGBFrame,
-        output: OutputResolution,
-        filters: FilterConfig
-    ) -> RGBFrame {
-        var resized = resizeIfNeeded(frame: frame, targetWidth: output.width, targetHeight: output.height)
-        resized = applySaturation(frame: resized, saturation: filters.saturation)
-        resized = applyBrightness(frame: resized, brightness: filters.brightness)
-        resized = applyContrast(frame: resized, contrast: filters.contrast)
-        resized = applySharpen(frame: resized, alpha: filters.sharpen)
-        resized = applyBalance(frame: resized, r: filters.balanceR, g: filters.balanceG, b: filters.balanceB)
-        return resized
+    deinit {
+        scaledBGRA.deallocate()
+        rgbBuffer.deallocate()
+        sharpenBuffer.deallocate()
     }
 
-    private static func resizeIfNeeded(frame: RGBFrame, targetWidth: Int, targetHeight: Int) -> RGBFrame {
-        if frame.width == targetWidth, frame.height == targetHeight {
-            return frame
+    public func process(bgra source: vImage_Buffer, filters: FilterConfig) -> RGBFrame {
+        scale(source: source)
+        swizzleToRGB()
+        applyColorFilters(filters)
+        if filters.sharpen != 0 {
+            applySharpen(alpha: filters.sharpen)
         }
-        var targetPixels = [UInt8](repeating: 0, count: targetWidth * targetHeight * 3)
-        let sourceWidth = frame.width
-        let sourceHeight = frame.height
-        let xScale = Float(sourceWidth) / Float(targetWidth)
-        let yScale = Float(sourceHeight) / Float(targetHeight)
-        let xTaps = axisTaps(sourceSize: sourceWidth, targetSize: targetWidth, scale: xScale)
-        let yTaps = axisTaps(sourceSize: sourceHeight, targetSize: targetHeight, scale: yScale)
-
-        for y in 0..<targetHeight {
-            let rowTaps = yTaps[y]
-            for x in 0..<targetWidth {
-                let columnTaps = xTaps[x]
-                var rSum: Float = 0
-                var gSum: Float = 0
-                var bSum: Float = 0
-                var weightSum: Float = 0
-
-                for yTap in rowTaps {
-                    let rowBase = yTap.sourceIndex * sourceWidth
-                    for xTap in columnTaps {
-                        let weight = xTap.weight * yTap.weight
-                        let sourceIndex = (rowBase + xTap.sourceIndex) * 3
-                        rSum += Float(frame.pixels[sourceIndex]) * weight
-                        gSum += Float(frame.pixels[sourceIndex + 1]) * weight
-                        bSum += Float(frame.pixels[sourceIndex + 2]) * weight
-                        weightSum += weight
-                    }
-                }
-
-                let targetIndex = (y * targetWidth + x) * 3
-                if weightSum > 0 {
-                    targetPixels[targetIndex] = clip(rSum / weightSum)
-                    targetPixels[targetIndex + 1] = clip(gSum / weightSum)
-                    targetPixels[targetIndex + 2] = clip(bSum / weightSum)
-                }
-            }
-        }
-        return RGBFrame(width: targetWidth, height: targetHeight, pixels: targetPixels)
+        let pixels = [UInt8](UnsafeBufferPointer(start: rgbBuffer, count: pixelCount * 3))
+        return RGBFrame(width: outputWidth, height: outputHeight, pixels: pixels)
     }
 
-    private static func axisTaps(sourceSize: Int, targetSize: Int, scale: Float) -> [[AxisTap]] {
-        var taps = [[AxisTap]]()
-        taps.reserveCapacity(targetSize)
-        for target in 0..<targetSize {
-            let start = Float(target) * scale
-            let end = Float(target + 1) * scale
-            let sourceStart = max(0, Int(start.rounded(.down)))
-            let sourceEnd = min(sourceSize, Int(end.rounded(.up)))
-            var pixelTaps = [AxisTap]()
-            pixelTaps.reserveCapacity(max(1, sourceEnd - sourceStart))
-            for source in sourceStart..<sourceEnd {
-                let weight = min(Float(source + 1), end) - max(Float(source), start)
-                if weight > 0 {
-                    pixelTaps.append(AxisTap(sourceIndex: source, weight: weight))
-                }
-            }
-            taps.append(pixelTaps)
-        }
-        return taps
-    }
-
-    private static func applyBrightness(frame: RGBFrame, brightness: Float) -> RGBFrame {
-        mapChannels(frame: frame) { channel in
-            var out = [Float](repeating: 0, count: channel.count)
-            var scale = brightness
-            vDSP_vsmul(channel, 1, &scale, &out, 1, vDSP_Length(channel.count))
-            return out
-        }
-    }
-
-    private static func applyContrast(frame: RGBFrame, contrast: Float) -> RGBFrame {
-        mapChannels(frame: frame) { channel in
-            var mean: Float = 0
-            vDSP_meanv(channel, 1, &mean, vDSP_Length(channel.count))
-            var centered = [Float](repeating: 0, count: channel.count)
-            var offset = -mean
-            vDSP_vsadd(channel, 1, &offset, &centered, 1, vDSP_Length(channel.count))
-            var scaled = [Float](repeating: 0, count: channel.count)
-            var alpha = contrast
-            vDSP_vsmul(centered, 1, &alpha, &scaled, 1, vDSP_Length(channel.count))
-            var restored = [Float](repeating: 0, count: channel.count)
-            var addMean = mean
-            vDSP_vsadd(scaled, 1, &addMean, &restored, 1, vDSP_Length(channel.count))
-            return restored
-        }
-    }
-
-    private static func applyBalance(frame: RGBFrame, r: Float, g: Float, b: Float) -> RGBFrame {
-        mapChannels(frame: frame) { channel, index in
-            let scale: Float = switch index {
-            case 0: r
-            case 1: g
-            default: b
-            }
-            var out = [Float](repeating: 0, count: channel.count)
-            var factor = scale
-            vDSP_vsmul(channel, 1, &factor, &out, 1, vDSP_Length(channel.count))
-            return out
-        }
-    }
-
-    private static func applySaturation(frame: RGBFrame, saturation: Float) -> RGBFrame {
-        var out = frame.pixels
-        for i in stride(from: 0, to: out.count, by: 3) {
-            let r = Float(out[i])
-            let g = Float(out[i + 1])
-            let b = Float(out[i + 2])
-            let gray = (0.299 * r) + (0.587 * g) + (0.114 * b)
-            out[i] = clip(gray + (r - gray) * saturation)
-            out[i + 1] = clip(gray + (g - gray) * saturation)
-            out[i + 2] = clip(gray + (b - gray) * saturation)
-        }
-        return RGBFrame(width: frame.width, height: frame.height, pixels: out)
-    }
-
-    private static func applySharpen(frame: RGBFrame, alpha: Float) -> RGBFrame {
-        if alpha == 0 { return frame }
-        var out = frame.pixels
-        let width = frame.width
-        let height = frame.height
-        let kernelCenter = 1 + (4 * alpha)
-        let kernelEdge = -alpha
-        for y in 1..<(height - 1) {
-            for x in 1..<(width - 1) {
-                for c in 0..<3 {
-                    let center = sample(frame, x: x, y: y, c: c)
-                    let top = sample(frame, x: x, y: y - 1, c: c)
-                    let left = sample(frame, x: x - 1, y: y, c: c)
-                    let right = sample(frame, x: x + 1, y: y, c: c)
-                    let bottom = sample(frame, x: x, y: y + 1, c: c)
-                    let value = (kernelCenter * center) + (kernelEdge * (top + left + right + bottom))
-                    out[(y * width + x) * 3 + c] = clip(value)
-                }
-            }
-        }
-        return RGBFrame(width: width, height: height, pixels: out)
-    }
-
-    private static func mapChannels(frame: RGBFrame, transform: (_ channel: [Float]) -> [Float]) -> RGBFrame {
-        mapChannels(frame: frame) { channel, _ in transform(channel) }
-    }
-
-    private static func mapChannels(frame: RGBFrame, transform: (_ channel: [Float], _ index: Int) -> [Float]) -> RGBFrame {
-        let count = frame.width * frame.height
-        var channels = [[Float]](
-            repeating: [Float](repeating: 0, count: count),
-            count: 3
+    private func scale(source: vImage_Buffer) {
+        var src = source
+        var dst = vImage_Buffer(
+            data: scaledBGRA,
+            height: vImagePixelCount(outputHeight),
+            width: vImagePixelCount(outputWidth),
+            rowBytes: bgraStride
         )
-        for i in 0..<count {
-            channels[0][i] = Float(frame.pixels[i * 3])
-            channels[1][i] = Float(frame.pixels[i * 3 + 1])
-            channels[2][i] = Float(frame.pixels[i * 3 + 2])
+        let ratioX = Double(src.width) / Double(outputWidth)
+        let ratioY = Double(src.height) / Double(outputHeight)
+        let ratio = max(ratioX, ratioY)
+        var flags = vImage_Flags(kvImageEdgeExtend) | vImage_Flags(kvImageDoNotTile)
+        if ratio < 8 {
+            flags |= vImage_Flags(kvImageHighQualityResampling)
         }
-        let r = transform(channels[0], 0)
-        let g = transform(channels[1], 1)
-        let b = transform(channels[2], 2)
-        var pixels = [UInt8](repeating: 0, count: count * 3)
-        for i in 0..<count {
-            pixels[i * 3] = clip(r[i])
-            pixels[i * 3 + 1] = clip(g[i])
-            pixels[i * 3 + 2] = clip(b[i])
-        }
-        return RGBFrame(width: frame.width, height: frame.height, pixels: pixels)
+        vImageScale_ARGB8888(&src, &dst, nil, flags)
     }
 
-    private static func sample(_ frame: RGBFrame, x: Int, y: Int, c: Int) -> Float {
-        Float(frame.pixels[(y * frame.width + x) * 3 + c])
+    private func swizzleToRGB() {
+        var src = vImage_Buffer(
+            data: scaledBGRA,
+            height: vImagePixelCount(outputHeight),
+            width: vImagePixelCount(outputWidth),
+            rowBytes: bgraStride
+        )
+        var dst = vImage_Buffer(
+            data: rgbBuffer,
+            height: vImagePixelCount(outputHeight),
+            width: vImagePixelCount(outputWidth),
+            rowBytes: outputWidth * 3
+        )
+        vImageConvert_BGRA8888toRGB888(&src, &dst, vImage_Flags(kvImageDoNotTile))
     }
 
-    private static func clip(_ value: Float) -> UInt8 {
-        UInt8(max(0, min(255, Int(value.rounded()))))
+    private func applyColorFilters(_ filters: FilterConfig) {
+        let s = filters.saturation
+        let oneMinusS = 1 - s
+        let satRR = s + oneMinusS * 0.299
+        let satRG = oneMinusS * 0.587
+        let satRB = oneMinusS * 0.114
+        let satGR = oneMinusS * 0.299
+        let satGG = s + oneMinusS * 0.587
+        let satGB = oneMinusS * 0.114
+        let satBR = oneMinusS * 0.299
+        let satBG = oneMinusS * 0.587
+        let satBB = s + oneMinusS * 0.114
+
+        var sumR: Float = 0
+        var sumG: Float = 0
+        var sumB: Float = 0
+        for i in 0..<pixelCount {
+            let p = rgbBuffer.advanced(by: i * 3)
+            sumR += Float(p[0])
+            sumG += Float(p[1])
+            sumB += Float(p[2])
+        }
+        let invN = 1 / Float(pixelCount)
+        let meanR = sumR * invN
+        let meanG = sumG * invN
+        let meanB = sumB * invN
+        let satMeanR = satRR * meanR + satRG * meanG + satRB * meanB
+        let satMeanG = satGR * meanR + satGG * meanG + satGB * meanB
+        let satMeanB = satBR * meanR + satBG * meanG + satBB * meanB
+
+        let c = filters.contrast
+        let oneMinusC = 1 - c
+        let postR = filters.balanceR * filters.brightness
+        let postG = filters.balanceG * filters.brightness
+        let postB = filters.balanceB * filters.brightness
+
+        let aRR = postR * c * satRR
+        let aRG = postR * c * satRG
+        let aRB = postR * c * satRB
+        let aGR = postG * c * satGR
+        let aGG = postG * c * satGG
+        let aGB = postG * c * satGB
+        let aBR = postB * c * satBR
+        let aBG = postB * c * satBG
+        let aBB = postB * c * satBB
+
+        let biasR = postR * oneMinusC * satMeanR
+        let biasG = postG * oneMinusC * satMeanG
+        let biasB = postB * oneMinusC * satMeanB
+
+        for i in 0..<pixelCount {
+            let p = rgbBuffer.advanced(by: i * 3)
+            let r = Float(p[0])
+            let g = Float(p[1])
+            let b = Float(p[2])
+            p[0] = clip(aRR * r + aRG * g + aRB * b + biasR)
+            p[1] = clip(aGR * r + aGG * g + aGB * b + biasG)
+            p[2] = clip(aBR * r + aBG * g + aBB * b + biasB)
+        }
     }
+
+    private func applySharpen(alpha: Float) {
+        let kc = 1 + (4 * alpha)
+        let ke = -alpha
+        let width = outputWidth
+        let height = outputHeight
+        memcpy(sharpenBuffer, rgbBuffer, pixelCount * 3)
+        for y in 0..<height {
+            let yUp = max(0, y - 1)
+            let yDn = min(height - 1, y + 1)
+            for x in 0..<width {
+                let xLf = max(0, x - 1)
+                let xRt = min(width - 1, x + 1)
+                let baseC = (y * width + x) * 3
+                let baseU = (yUp * width + x) * 3
+                let baseD = (yDn * width + x) * 3
+                let baseL = (y * width + xLf) * 3
+                let baseR = (y * width + xRt) * 3
+                for c in 0..<3 {
+                    let center = Float(sharpenBuffer[baseC + c])
+                    let top = Float(sharpenBuffer[baseU + c])
+                    let bot = Float(sharpenBuffer[baseD + c])
+                    let lf = Float(sharpenBuffer[baseL + c])
+                    let rt = Float(sharpenBuffer[baseR + c])
+                    rgbBuffer[baseC + c] = clip(kc * center + ke * (top + bot + lf + rt))
+                }
+            }
+        }
+    }
+}
+
+@inline(__always)
+private func clip(_ value: Float) -> UInt8 {
+    if value <= 0 { return 0 }
+    if value >= 255 { return 255 }
+    return UInt8(value.rounded())
 }

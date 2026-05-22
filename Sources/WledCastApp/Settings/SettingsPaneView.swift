@@ -145,6 +145,25 @@ private struct VideoSourceSection: View {
 
     var body: some View {
         SectionCard(title: "Video Source", systemImage: "film") {
+            HStack(spacing: 8) {
+                TextField("YouTube URL", text: $model.youtubeURLInput)
+                    .textFieldStyle(.roundedBorder)
+                    .disableAutocorrection(true)
+                Button("Fetch") {
+                    model.fetchYouTube()
+                }
+                .disabled(model.youtubeURLInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.fetchState == .running)
+            }
+
+            if case .failed(let message) = model.fetchState {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            } else if model.fetchState == .running {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
             Picker("Source", selection: Binding(
                 get: { model.selectedVideo?.path ?? "" },
                 set: { newPath in

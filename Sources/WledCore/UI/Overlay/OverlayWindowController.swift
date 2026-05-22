@@ -7,7 +7,6 @@ import SwiftUI
 public final class OverlayWindowController: NSWindowController, ObservableObject {
     public var onChange: ((CaptureBox) -> Void)?
     public var onVideoCropChange: ((VideoCropBox) -> Void)?
-    public var onTopRegionSizeChange: ((CGSize) -> Void)?
     public var aspectLock = true
     @Published public var outputResolution = OutputResolution(width: 1, height: 1)
     @Published public var mosaicEnabled = false
@@ -86,14 +85,6 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
     public func setMinimumSettingsWidth(_ width: CGFloat) {
         minimumSettingsWidth = max(minimumTopSide, width)
         updateWindowMinimums()
-    }
-
-    public func setTopRegionSize(_ size: CGSize) {
-        guard let window else { return }
-        var topFrame = Self.topRegionFrame(windowFrame: window.frame, settingsHeight: settingsHeight)
-        topFrame.size.width = max(minimumSettingsWidth, size.width)
-        topFrame.size.height = max(minimumTopSide, size.height)
-        applyTopFrame(topFrame)
     }
 
     public func setPreviewImage(_ image: NSImage) {
@@ -260,7 +251,6 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
         window?.setFrame(clamped, display: true)
         let topFrame = Self.topRegionFrame(windowFrame: clamped, settingsHeight: settingsHeight)
         updateBox(fromTopFrame: topFrame)
-        onTopRegionSizeChange?(topFrame.size)
     }
 
     fileprivate func updateBox(fromTopFrame topFrame: NSRect) {
@@ -298,7 +288,6 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
                 window.setFrame(clamped, display: true)
                 let topFrame = Self.topRegionFrame(windowFrame: clamped, settingsHeight: settingsHeight)
                 updateBox(fromTopFrame: topFrame)
-                onTopRegionSizeChange?(topFrame.size)
             }
             return
         }
@@ -311,7 +300,6 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
         window.setFrame(clamped, display: true)
         let topFrame = Self.topRegionFrame(windowFrame: clamped, settingsHeight: settingsHeight)
         updateBox(fromTopFrame: topFrame)
-        onTopRegionSizeChange?(topFrame.size)
     }
 
     private func clampToScreen(_ frame: NSRect) -> NSRect {

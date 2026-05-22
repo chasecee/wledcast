@@ -1,10 +1,11 @@
+import Accelerate
 import AVFoundation
 import CoreMedia
 import CoreVideo
 import Foundation
 
 public final class VideoFrameSource: @unchecked Sendable {
-    public var onFrame: ((RGBFrame) -> Void)?
+    public var onFrameBGRA: ((vImage_Buffer) -> Void)?
     public var onPreviewBuffer: ((CVPixelBuffer) -> Void)?
 
     public private(set) var videoSize: CGSize = .zero
@@ -188,8 +189,21 @@ public final class VideoFrameSource: @unchecked Sendable {
         }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         onPreviewBuffer?(pixelBuffer)
-        guard let frame = makeFrame(from: pixelBuffer) else { return }
-        onFrame?(frame)
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let crop = normalizedCrop(forWidth: width, height: height)
+        let cropped = baseAddress.advanced(by: crop.y * bytesPerRow + crop.x * 4)
+        let buffer = vImage_Buffer(
+            data: cropped,
+            height: vImagePixelCount(crop.height),
+            width: vImagePixelCount(crop.width),
+            rowBytes: bytesPerRow
+        )
+        onFrameBGRA?(buffer)
     }
 
     private func nextSampleBuffer() -> CMSampleBuffer? {
@@ -206,38 +220,6 @@ public final class VideoFrameSource: @unchecked Sendable {
         let restartedOutput = self.output
         lock.unlock()
         return restartedOutput?.copyNextSampleBuffer()
-    }
-
-    private func makeFrame(from pixelBuffer: CVPixelBuffer) -> RGBFrame? {
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
-        let frameWidth = CVPixelBufferGetWidth(pixelBuffer)
-        let frameHeight = CVPixelBufferGetHeight(pixelBuffer)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let src = baseAddress.assumingMemoryBound(to: UInt8.self)
-
-        let crop = normalizedCrop(forWidth: frameWidth, height: frameHeight)
-        let outWidth = max(1, crop.width)
-        let outHeight = max(1, crop.height)
-        var rgb = [UInt8](repeating: 0, count: outWidth * outHeight * 3)
-
-        rgb.withUnsafeMutableBufferPointer { buffer in
-            guard let dst = buffer.baseAddress else { return }
-            for y in 0..<outHeight {
-                let srcRow = src.advanced(by: (crop.y + y) * bytesPerRow)
-                let outRow = dst.advanced(by: y * outWidth * 3)
-                for x in 0..<outWidth {
-                    let srcOffset = (crop.x + x) * 4
-                    let outOffset = x * 3
-                    outRow[outOffset] = srcRow[srcOffset + 2]
-                    outRow[outOffset + 1] = srcRow[srcOffset + 1]
-                    outRow[outOffset + 2] = srcRow[srcOffset]
-                }
-            }
-        }
-
-        return RGBFrame(width: outWidth, height: outHeight, pixels: rgb)
     }
 
     private func normalizedCrop(forWidth width: Int, height: Int) -> (x: Int, y: Int, width: Int, height: Int) {

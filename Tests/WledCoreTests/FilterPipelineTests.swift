@@ -1,85 +1,60 @@
+import Accelerate
 import Foundation
 import XCTest
 @testable import WledCore
 
 final class FilterPipelineTests: XCTestCase {
-    func testFilterPipelineMatchesFixture() throws {
-        let fixture = try FixtureLoader.loadJSON(name: "filter_fixture")
-        let inputWidth = fixture["input_width"] as! Int
-        let inputHeight = fixture["input_height"] as! Int
-        let outputWidth = fixture["output_width"] as! Int
-        let outputHeight = fixture["output_height"] as! Int
-        let inputPixels = fixture["input_pixels"] as! [Int]
-        let outputPixels = fixture["output_pixels"] as! [Int]
-        let filters = fixture["filters"] as! [String: Any]
-
-        let frame = RGBFrame(width: inputWidth, height: inputHeight, pixels: inputPixels.map(UInt8.init))
-        let config = FilterConfig(
-            sharpen: (filters["sharpen"] as! NSNumber).floatValue,
-            saturation: (filters["saturation"] as! NSNumber).floatValue,
-            brightness: (filters["brightness"] as! NSNumber).floatValue,
-            contrast: (filters["contrast"] as! NSNumber).floatValue,
-            balanceR: (filters["balance_r"] as! NSNumber).floatValue,
-            balanceG: (filters["balance_g"] as! NSNumber).floatValue,
-            balanceB: (filters["balance_b"] as! NSNumber).floatValue
-        )
-
-        let processed = FramePipeline.process(
-            frame: frame,
-            output: OutputResolution(width: outputWidth, height: outputHeight),
-            filters: config
-        )
-
-        let expected = outputPixels.map(UInt8.init)
-        XCTAssertEqual(processed.pixels.count, expected.count)
-        let maxDelta = zip(processed.pixels, expected).map { abs(Int($0) - Int($1)) }.max() ?? 0
-        XCTAssertLessThanOrEqual(maxDelta, 80)
-    }
-
-    func testResizeIncludesBottomEdgeContribution() {
-        let sourceWidth = 6
-        let sourceHeight = 7
-        var pixels = [UInt8](repeating: 0, count: sourceWidth * sourceHeight * 3)
-        for x in 0..<sourceWidth {
-            let i = ((sourceHeight - 1) * sourceWidth + x) * 3
-            pixels[i] = 255
+    func testNeutralFiltersPreserveSolidColor() {
+        let width = 32
+        let height = 32
+        let bgra = solidBGRA(width: width, height: height, b: 80, g: 160, r: 200)
+        let pipeline = FramePipeline(output: OutputResolution(width: 4, height: 4))
+        let frame = withBuffer(bgra: bgra, width: width, height: height) { buffer in
+            pipeline.process(bgra: buffer, filters: neutralFilters)
         }
-
-        let frame = RGBFrame(width: sourceWidth, height: sourceHeight, pixels: pixels)
-        let processed = FramePipeline.process(
-            frame: frame,
-            output: OutputResolution(width: 3, height: 3),
-            filters: neutralFilters
-        )
-
-        let bottomLeftRed = processed.pixels[((2 * 3) + 0) * 3]
-        let bottomCenterRed = processed.pixels[((2 * 3) + 1) * 3]
-        let bottomRightRed = processed.pixels[((2 * 3) + 2) * 3]
-        XCTAssertGreaterThan(bottomLeftRed, 0)
-        XCTAssertGreaterThan(bottomCenterRed, 0)
-        XCTAssertGreaterThan(bottomRightRed, 0)
+        XCTAssertEqual(frame.width, 4)
+        XCTAssertEqual(frame.height, 4)
+        for i in stride(from: 0, to: frame.pixels.count, by: 3) {
+            XCTAssertEqual(Int(frame.pixels[i]), 200, accuracy: 2)
+            XCTAssertEqual(Int(frame.pixels[i + 1]), 160, accuracy: 2)
+            XCTAssertEqual(Int(frame.pixels[i + 2]), 80, accuracy: 2)
+        }
     }
 
-    func testResizeIsDeterministicAcrossRepeatedCalls() {
-        let sourceWidth = 436
-        let sourceHeight = 132
-        var pixels = [UInt8](repeating: 0, count: sourceWidth * sourceHeight * 3)
-        for y in 0..<sourceHeight {
-            for x in 0..<sourceWidth {
-                let i = (y * sourceWidth + x) * 3
-                pixels[i] = UInt8((x * 7 + y * 3) % 256)
-                pixels[i + 1] = UInt8((x * 5 + y * 11) % 256)
-                pixels[i + 2] = UInt8((x * 13 + y * 2) % 256)
+    func testScaleEdgeExtendDoesNotBleed() {
+        let width = 16
+        let height = 16
+        var bgra = [UInt8](repeating: 0, count: width * height * 4)
+        for y in 0..<height {
+            for x in 0..<width {
+                let i = (y * width + x) * 4
+                bgra[i] = 0
+                bgra[i + 1] = 0
+                bgra[i + 2] = 255
+                bgra[i + 3] = 255
             }
         }
+        let pipeline = FramePipeline(output: OutputResolution(width: 4, height: 4))
+        let frame = withBuffer(bgra: bgra, width: width, height: height) { buffer in
+            pipeline.process(bgra: buffer, filters: neutralFilters)
+        }
+        for i in stride(from: 0, to: frame.pixels.count, by: 3) {
+            XCTAssertEqual(Int(frame.pixels[i]), 255, accuracy: 3)
+            XCTAssertEqual(Int(frame.pixels[i + 1]), 0, accuracy: 3)
+            XCTAssertEqual(Int(frame.pixels[i + 2]), 0, accuracy: 3)
+        }
+    }
 
-        let frame = RGBFrame(width: sourceWidth, height: sourceHeight, pixels: pixels)
-        let output = OutputResolution(width: 60, height: 18)
-        let first = FramePipeline.process(frame: frame, output: output, filters: neutralFilters)
-
-        for _ in 0..<20 {
-            let next = FramePipeline.process(frame: frame, output: output, filters: neutralFilters)
-            XCTAssertEqual(next.pixels, first.pixels)
+    func testBrightnessScalesLuminance() {
+        let bgra = solidBGRA(width: 8, height: 8, b: 100, g: 100, r: 100)
+        let pipeline = FramePipeline(output: OutputResolution(width: 2, height: 2))
+        var filters = neutralFilters
+        filters.brightness = 0.5
+        let frame = withBuffer(bgra: bgra, width: 8, height: 8) { buffer in
+            pipeline.process(bgra: buffer, filters: filters)
+        }
+        for v in frame.pixels {
+            XCTAssertEqual(Int(v), 50, accuracy: 2)
         }
     }
 
@@ -93,5 +68,34 @@ final class FilterPipelineTests: XCTestCase {
             balanceG: 1,
             balanceB: 1
         )
+    }
+
+    private func solidBGRA(width: Int, height: Int, b: UInt8, g: UInt8, r: UInt8) -> [UInt8] {
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        for i in stride(from: 0, to: pixels.count, by: 4) {
+            pixels[i] = b
+            pixels[i + 1] = g
+            pixels[i + 2] = r
+            pixels[i + 3] = 255
+        }
+        return pixels
+    }
+
+    private func withBuffer<T>(
+        bgra: [UInt8],
+        width: Int,
+        height: Int,
+        _ block: (vImage_Buffer) -> T
+    ) -> T {
+        var pixels = bgra
+        return pixels.withUnsafeMutableBufferPointer { ptr in
+            let buffer = vImage_Buffer(
+                data: ptr.baseAddress,
+                height: vImagePixelCount(height),
+                width: vImagePixelCount(width),
+                rowBytes: width * 4
+            )
+            return block(buffer)
+        }
     }
 }

@@ -1,12 +1,17 @@
 import ApplicationServices
 import AppKit
 import AVFoundation
-import Combine
 import CoreGraphics
 import CoreMedia
 import Foundation
 import SwiftUI
 import WledCore
+
+enum FetchState: Equatable {
+    case idle
+    case running
+    case failed(String)
+}
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -19,8 +24,9 @@ final class AppModel: ObservableObject {
     @Published var captureMode: CaptureMode = .region
     @Published var videoLibrary: [URL] = []
     @Published var selectedVideo: URL?
+    @Published var youtubeURLInput: String = ""
+    @Published var fetchState: FetchState = .idle
     @Published var videoCropBox: VideoCropBox = .full
-    @Published var videoWindowSize = CGSize(width: 640, height: 360)
     @Published var loopVideo = true
     @Published var loopRange: LoopRange = .full
     @Published var overlayMosaicEnabled = true
@@ -36,16 +42,18 @@ final class AppModel: ObservableObject {
     private var source: DisplayFrameSource?
     private var videoSource: VideoFrameSource?
     private var videoPreviewSource: VideoFrameSource?
-    private var pacer: FramePacer?
     private var overlay: OverlayWindowController?
     private var boxRef: CaptureBoxRef?
     private var lastMosaicImage: NSImage?
+    private var lastPreviewUpdate: Date = .distantPast
+    private let previewMinInterval: TimeInterval = 0.1
     private var scrubGenerator: AVAssetImageGenerator?
     private var scrubAssetURL: URL?
     private var scrubAssetDuration: CMTime = .zero
-    private var isScrubbing = false
 
     private let defaults = UserDefaults.standard
+    private let youtubeDownloader = YouTubeDownloader()
+    private var fetchTask: Task<Void, Never>?
 
     init() {
         restore()
@@ -217,6 +225,34 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func fetchYouTube() {
+        guard fetchState != .running else { return }
+        let requestedURL = youtubeURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !requestedURL.isEmpty else { return }
+
+        fetchState = .running
+        let scriptURL = resolvedFetchScriptURL()
+        fetchTask?.cancel()
+        fetchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let savedURL = try await self.youtubeDownloader.fetch(url: requestedURL, scriptURL: scriptURL)
+                self.refreshVideoLibrary()
+                let selected = self.videoLibrary.first {
+                    $0.standardizedFileURL.path == savedURL.standardizedFileURL.path
+                } ?? savedURL
+                self.setSelectedVideo(selected)
+                self.youtubeURLInput = ""
+                self.fetchState = .idle
+            } catch is CancellationError {
+                self.fetchState = .idle
+            } catch {
+                self.fetchState = .failed(error.localizedDescription)
+                Log.capture.error("youtube fetch failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     func setFilters(_ value: FilterConfig) {
         filters = value
         session?.updateFilters(value)
@@ -268,15 +304,6 @@ final class AppModel: ObservableObject {
                 .environmentObject(self)
             )
         )
-        controller.onTopRegionSizeChange = { [weak self] size in
-            Task { @MainActor in
-                guard let self else { return }
-                if self.captureMode == .video {
-                    self.videoWindowSize = size
-                    self.persist()
-                }
-            }
-        }
         controller.onChange = { [weak self] box in
             Task { @MainActor in
                 guard let self else { return }
@@ -359,8 +386,8 @@ final class AppModel: ObservableObject {
                     loop: loopVideo,
                     loopRange: loopRange
                 )
-                videoSource.onFrame = { [weak controller] frame in
-                    controller?.process(frame: frame)
+                videoSource.onFrameBGRA = { [weak controller] buffer in
+                    controller?.process(bgra: buffer)
                 }
                 videoSource.onPreviewBuffer = { [weak self] buffer in
                     Task { @MainActor in
@@ -370,7 +397,6 @@ final class AppModel: ObservableObject {
                 stopVideoPreview()
                 self.videoSource = videoSource
                 source = nil
-                pacer = nil
             case .region:
                 stopVideoPreview()
                 startScreenCaptureStream(resolution: resolution, controller: controller)
@@ -394,16 +420,10 @@ final class AppModel: ObservableObject {
             captureSelection: selection,
             excludedWindowIDs: excludedWindows
         )
+        frameSource.onFrameBGRA = { [weak controller] buffer in
+            controller?.process(bgra: buffer)
+        }
         source = frameSource
-        let newPacer = FramePacer()
-        newPacer.onTick = { [weak controller] frame in
-            controller?.process(frame: frame)
-        }
-        frameSource.onFrame = { [weak newPacer] frame in
-            newPacer?.ingest(frame)
-        }
-        newPacer.start(fps: fps)
-        pacer = newPacer
     }
 
     private func restartStreaming() {
@@ -417,8 +437,6 @@ final class AppModel: ObservableObject {
         source = nil
         videoSource?.stop()
         videoSource = nil
-        pacer?.stop()
-        pacer = nil
         boxRef = nil
         session?.stop()
         session = nil
@@ -488,8 +506,6 @@ final class AppModel: ObservableObject {
         defaults.set(selectedVideo?.path, forKey: "selectedVideoPath")
         defaults.set(loopVideo, forKey: "loopVideo")
         defaults.set(overlayMosaicEnabled, forKey: "overlayMosaicEnabled")
-        defaults.set(videoWindowSize.width, forKey: "videoWindowWidth")
-        defaults.set(videoWindowSize.height, forKey: "videoWindowHeight")
         if let loopData = try? JSONEncoder().encode(loopRange) {
             defaults.set(loopData, forKey: "loopRange")
         }
@@ -506,8 +522,6 @@ final class AppModel: ObservableObject {
         if let cropData = try? JSONEncoder().encode(videoCropBox) {
             defaults.set(cropData, forKey: "videoCropBox")
         }
-        defaults.removeObject(forKey: "dockedPanelWidth")
-        defaults.removeObject(forKey: "dockedPanelVisible")
     }
 
     private func restore() {
@@ -543,17 +557,10 @@ final class AppModel: ObservableObject {
         if let path = defaults.string(forKey: "selectedVideoPath"), !path.isEmpty {
             selectedVideo = URL(fileURLWithPath: path)
         }
-        let savedVideoWidth = defaults.double(forKey: "videoWindowWidth")
-        let savedVideoHeight = defaults.double(forKey: "videoWindowHeight")
-        if savedVideoWidth > 0, savedVideoHeight > 0 {
-            videoWindowSize = CGSize(width: savedVideoWidth, height: savedVideoHeight)
-        }
         if let loopData = defaults.data(forKey: "loopRange"),
            let decodedLoop = try? JSONDecoder().decode(LoopRange.self, from: loopData) {
             loopRange = decodedLoop.clamped()
         }
-        defaults.removeObject(forKey: "dockedPanelWidth")
-        defaults.removeObject(forKey: "dockedPanelVisible")
     }
 
     private func videoDirectoryURL() -> URL {
@@ -576,6 +583,23 @@ final class AppModel: ObservableObject {
         return cwdVideos
     }
 
+    private func resolvedFetchScriptURL() -> URL {
+        let fm = FileManager.default
+        let cwdScript = URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("Scripts/fetch_video.sh")
+        if fm.isExecutableFile(atPath: cwdScript.path) { return cwdScript }
+
+        let bundleDir = Bundle.main.bundleURL.deletingLastPathComponent()
+        let siblingScript = bundleDir.appendingPathComponent("Scripts/fetch_video.sh")
+        if fm.isExecutableFile(atPath: siblingScript.path) { return siblingScript }
+
+        let resourcesScript = bundleDir.appendingPathComponent("Resources/Scripts/fetch_video.sh")
+        if fm.isExecutableFile(atPath: resourcesScript.path) { return resourcesScript }
+
+        let parentScript = bundleDir.deletingLastPathComponent().appendingPathComponent("Scripts/fetch_video.sh")
+        if fm.isExecutableFile(atPath: parentScript.path) { return parentScript }
+        return cwdScript
+    }
+
     private func directoryContainsVideos(_ directory: URL) -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: directory.path) else { return false }
@@ -584,6 +608,9 @@ final class AppModel: ObservableObject {
     }
 
     private func updatePreview(_ frame: RGBFrame) {
+        let now = Date()
+        guard now.timeIntervalSince(lastPreviewUpdate) >= previewMinInterval else { return }
+        lastPreviewUpdate = now
         let image = makePreviewImage(frame)
         lastMosaicImage = image
         overlay?.mosaicImage = image
@@ -625,11 +652,6 @@ final class AppModel: ObservableObject {
                 loop: loopVideo,
                 loopRange: loopRange
             )
-            preview.onFrame = { [weak self] frame in
-                Task { @MainActor in
-                    self?.updatePreview(frame)
-                }
-            }
             preview.onPreviewBuffer = { [weak self] buffer in
                 Task { @MainActor in
                     self?.overlay?.setPreviewBuffer(buffer)
@@ -642,7 +664,6 @@ final class AppModel: ObservableObject {
     }
 
     func beginLoopScrub() {
-        isScrubbing = true
         videoPreviewSource?.stop()
         videoPreviewSource = nil
         videoSource?.stop()
@@ -684,7 +705,6 @@ final class AppModel: ObservableObject {
     }
 
     func commitLoopRange(_ range: LoopRange) {
-        isScrubbing = false
         let clamped = range.clamped()
         let changed = loopRange != clamped
         loopRange = clamped
@@ -697,21 +717,15 @@ final class AppModel: ObservableObject {
     }
 
     private func makePreviewImage(_ frame: RGBFrame) -> NSImage? {
-        var rgba = [UInt8](repeating: 255, count: frame.width * frame.height * 4)
-        for i in 0..<(frame.width * frame.height) {
-            rgba[i * 4] = frame.pixels[i * 3]
-            rgba[i * 4 + 1] = frame.pixels[i * 3 + 1]
-            rgba[i * 4 + 2] = frame.pixels[i * 3 + 2]
-        }
-        guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
+        guard let provider = CGDataProvider(data: Data(frame.pixels) as CFData) else { return nil }
         guard let cgImage = CGImage(
             width: frame.width,
             height: frame.height,
             bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: frame.width * 4,
+            bitsPerPixel: 24,
+            bytesPerRow: frame.width * 3,
             space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
             provider: provider,
             decode: nil,
             shouldInterpolate: false,
