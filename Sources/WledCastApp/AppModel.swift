@@ -393,6 +393,7 @@ final class AppModel: ObservableObject {
     private func ensureOverlay() -> OverlayWindowController {
         if let overlay {
             overlay.setMode(captureMode)
+            overlay.setCaptureBox(captureBox)
             overlay.setVideoCrop(videoCropBox)
             if let resolution = outputResolution {
                 overlay.outputResolution = resolution
@@ -405,6 +406,7 @@ final class AppModel: ObservableObject {
 
         let controller = OverlayWindowController(captureBox: captureBox)
         controller.setMode(captureMode)
+        controller.setCaptureBox(captureBox)
         controller.setVideoCrop(videoCropBox)
         if let resolution = outputResolution {
             controller.outputResolution = resolution

@@ -87,9 +87,7 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
         videoAspectRatio ?? CGFloat(outputResolution.width) / CGFloat(max(1, outputResolution.height))
     }
     private var dragOriginFrame: NSRect?
-    private var dragOriginCaptureBox: CaptureBox?
     private var resizeOriginTopFrame: NSRect?
-    private var resizeOriginCaptureBox: CaptureBox?
     private var dragOriginMouse: NSPoint?
     private var monitor: Any?
     private var settingsHeight: CGFloat = 320
@@ -102,9 +100,9 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
     }
 
     public init(captureBox: CaptureBox, windowFrame: NSRect? = nil) {
-        let initialScreen = NSScreen.main ?? NSScreen.screens.first!
+        let initialScreen = NSScreen.screen(for: captureBox.displayID) ?? NSScreen.main ?? NSScreen.screens.first!
         self.captureBox = captureBox
-        let initialFrame = windowFrame ?? Self.defaultWindowFrame(on: initialScreen, settingsHeight: settingsHeight)
+        let initialFrame = windowFrame ?? captureBox.windowRect(on: initialScreen, settingsHeight: settingsHeight)
         let window = OverlayWindow(contentRect: initialFrame, styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "WledCast"
         window.isOpaque = true
@@ -129,7 +127,22 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
         self.mode = mode
         if mode == .video {
             enforceVideoAspectOnTopRegion()
+        } else {
+            syncWindowToCaptureBox()
         }
+    }
+
+    public func setCaptureBox(_ box: CaptureBox) {
+        captureBox = box
+        if mode == .region {
+            syncWindowToCaptureBox()
+        }
+    }
+
+    public func syncWindowToCaptureBox() {
+        guard mode == .region, window != nil else { return }
+        guard let screen = NSScreen.screen(for: captureBox.displayID) ?? NSScreen.main else { return }
+        applyWindowFrame(captureBox.windowRect(on: screen, settingsHeight: settingsHeight))
     }
     public func setVideoCrop(_ crop: VideoCropBox) { videoCropBox = normalize(crop) }
     public func setSettingsContent(_ content: AnyView) { settingsContent = content }
@@ -215,10 +228,6 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
     }
 
     public func nudge(dx: CGFloat, dy: CGFloat) {
-        if mode == .region {
-            nudgeCaptureBox(dx: dx, dy: dy)
-            return
-        }
         guard let window else { return }
         var frame = window.frame
         frame.origin.x += dx
@@ -227,23 +236,12 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
     }
 
     public func startDrag() {
-        guard dragOriginMouse == nil else { return }
-        if mode == .region {
-            guard dragOriginCaptureBox == nil else { return }
-            dragOriginCaptureBox = captureBox
-            dragOriginMouse = NSEvent.mouseLocation
-            return
-        }
-        guard dragOriginFrame == nil, let window else { return }
+        guard dragOriginFrame == nil, dragOriginMouse == nil, let window else { return }
         dragOriginFrame = window.frame
         dragOriginMouse = NSEvent.mouseLocation
     }
 
     public func move() {
-        if mode == .region {
-            moveCaptureBox()
-            return
-        }
         guard let start = dragOriginFrame, let startMouse = dragOriginMouse else { return }
         let currentMouse = NSEvent.mouseLocation
         var frame = start
@@ -253,23 +251,12 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
     }
 
     public func startResize() {
-        guard dragOriginMouse == nil else { return }
-        if mode == .region {
-            guard resizeOriginCaptureBox == nil else { return }
-            resizeOriginCaptureBox = captureBox
-            dragOriginMouse = NSEvent.mouseLocation
-            return
-        }
-        guard resizeOriginTopFrame == nil, let window else { return }
+        guard dragOriginMouse == nil, resizeOriginTopFrame == nil, let window else { return }
         resizeOriginTopFrame = Self.topRegionFrame(windowFrame: window.frame, settingsHeight: settingsHeight)
         dragOriginMouse = NSEvent.mouseLocation
     }
 
     public func resize(handle: OverlayHandle) {
-        if mode == .region {
-            resizeCaptureBox(handle: handle)
-            return
-        }
         guard let start = resizeOriginTopFrame, let startMouse = dragOriginMouse else { return }
         let currentMouse = NSEvent.mouseLocation
         let dx = currentMouse.x - startMouse.x
@@ -307,16 +294,15 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
                 if handle == .left || handle == .topLeft || handle == .bottomLeft { topFrame.origin.x += delta }
             }
         }
-        topFrame.size.width = max(minimumSettingsWidth, topFrame.size.width)
+        let minTopWidth = mode == .region ? minimumTopSide : minimumSettingsWidth
+        topFrame.size.width = max(minTopWidth, topFrame.size.width)
         topFrame.size.height = max(minimumTopSide, topFrame.size.height)
         applyTopFrame(topFrame)
     }
 
     public func endDrag() {
         dragOriginFrame = nil
-        dragOriginCaptureBox = nil
         resizeOriginTopFrame = nil
-        resizeOriginCaptureBox = nil
         dragOriginMouse = nil
     }
 
@@ -358,91 +344,23 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
     private func applyWindowFrame(_ frame: NSRect) {
         let clamped = clampToScreen(frame)
         window?.setFrame(clamped, display: true)
-    }
-
-    private func moveCaptureBox() {
-        guard let start = dragOriginCaptureBox,
-              let startMouse = dragOriginMouse,
-              let screen = NSScreen.screen(for: start.displayID) ?? NSScreen.main else { return }
-        let currentMouse = NSEvent.mouseLocation
-        var frame = start.nsRect(on: screen)
-        frame.origin.x += currentMouse.x - startMouse.x
-        frame.origin.y += currentMouse.y - startMouse.y
-        applyCaptureBox(CaptureBox(nsFrame: frame, screen: screen))
-    }
-
-    private func nudgeCaptureBox(dx: CGFloat, dy: CGFloat) {
-        guard let screen = NSScreen.screen(for: captureBox.displayID) ?? NSScreen.main else { return }
-        var frame = captureBox.nsRect(on: screen)
-        frame.origin.x += dx
-        frame.origin.y += dy
-        applyCaptureBox(CaptureBox(nsFrame: frame, screen: screen))
-    }
-
-    private func resizeCaptureBox(handle: OverlayHandle) {
-        guard let start = resizeOriginCaptureBox,
-              let startMouse = dragOriginMouse,
-              let screen = NSScreen.screen(for: start.displayID) ?? NSScreen.main else { return }
-        let currentMouse = NSEvent.mouseLocation
-        let dx = currentMouse.x - startMouse.x
-        let dy = currentMouse.y - startMouse.y
-        var topFrame = start.nsRect(on: screen)
-        switch handle {
-        case .topLeft:
-            topFrame.origin.x += dx; topFrame.size.width -= dx; topFrame.size.height += dy
-        case .top:
-            topFrame.size.height += dy
-        case .topRight:
-            topFrame.size.width += dx; topFrame.size.height += dy
-        case .right:
-            topFrame.size.width += dx
-        case .bottomRight:
-            topFrame.size.width += dx; topFrame.origin.y += dy; topFrame.size.height -= dy
-        case .bottom:
-            topFrame.origin.y += dy; topFrame.size.height -= dy
-        case .bottomLeft:
-            topFrame.origin.x += dx; topFrame.size.width -= dx; topFrame.origin.y += dy; topFrame.size.height -= dy
-        case .left:
-            topFrame.origin.x += dx; topFrame.size.width -= dx
+        if mode == .region {
+            syncCaptureBoxFromWindowFrame(clamped)
         }
-        if let ratio = aspectRatioForCurrentMode() {
-            let widthDominant = abs(dx) >= abs(dy)
-            if widthDominant {
-                let newHeight = max(minimumTopSide, topFrame.width / ratio)
-                let delta = topFrame.height - newHeight
-                topFrame.size.height = newHeight
-                if handle == .bottom || handle == .bottomLeft || handle == .bottomRight { topFrame.origin.y += delta }
-            } else {
-                let newWidth = max(minimumTopSide, topFrame.height * ratio)
-                let delta = topFrame.width - newWidth
-                topFrame.size.width = newWidth
-                if handle == .left || handle == .topLeft || handle == .bottomLeft { topFrame.origin.x += delta }
-            }
-        }
-        topFrame.size.width = max(minimumTopSide, topFrame.size.width)
-        topFrame.size.height = max(minimumTopSide, topFrame.size.height)
-        applyCaptureBox(CaptureBox(nsFrame: topFrame, screen: screen))
     }
 
-    private func applyCaptureBox(_ box: CaptureBox) {
-        guard let screen = NSScreen.screen(for: box.displayID) ?? NSScreen.main else { return }
-        var frame = box.nsRect(on: screen)
-        frame = clampTopFrameToScreen(frame, on: screen)
-        let clamped = CaptureBox(nsFrame: frame, screen: screen)
-        captureBox = clamped
-        onChange?(clamped)
+    private func syncCaptureBoxFromWindowFrame(_ frame: NSRect) {
+        let screen = screenForWindowFrame(frame)
+        let box = CaptureBox(windowFrame: frame, settingsHeight: settingsHeight, screen: screen)
+        guard box != captureBox else { return }
+        captureBox = box
+        onChange?(box)
     }
 
-    private func clampTopFrameToScreen(_ frame: NSRect, on screen: NSScreen) -> NSRect {
-        let bounds = screen.frame
-        var out = frame
-        out.size.width = min(max(minimumTopSide, out.width), bounds.width)
-        out.size.height = min(max(minimumTopSide, out.height), bounds.height)
-        if out.minX < bounds.minX { out.origin.x = bounds.minX }
-        if out.minY < bounds.minY { out.origin.y = bounds.minY }
-        if out.maxX > bounds.maxX { out.origin.x = bounds.maxX - out.width }
-        if out.maxY > bounds.maxY { out.origin.y = bounds.maxY - out.height }
-        return out
+    private func screenForWindowFrame(_ frame: NSRect) -> NSScreen {
+        NSScreen.screens.max {
+            $0.frame.intersection(frame).rectArea < $1.frame.intersection(frame).rectArea
+        } ?? NSScreen.screen(for: captureBox.displayID) ?? NSScreen.main ?? NSScreen.screens.first!
     }
 
     private func startKeyMonitor() {
@@ -469,15 +387,19 @@ public final class OverlayWindowController: NSWindowController, ObservableObject
         guard let window else { return }
         let frame = window.frame
         if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(frame) }) {
-            let clamped = clampToScreen(frame)
-            if clamped != frame {
-                window.setFrame(clamped, display: true)
+            if frame != clampToScreen(frame) {
+                applyWindowFrame(frame)
+            } else if mode == .region {
+                syncCaptureBoxFromWindowFrame(frame)
             }
             return
         }
         guard let target = NSScreen.main ?? NSScreen.screens.first else { return }
-        let clamped = clampToScreen(Self.defaultWindowFrame(on: target, settingsHeight: settingsHeight))
-        window.setFrame(clamped, display: true)
+        if mode == .region {
+            applyWindowFrame(captureBox.windowRect(on: target, settingsHeight: settingsHeight))
+        } else {
+            applyWindowFrame(Self.defaultWindowFrame(on: target, settingsHeight: settingsHeight))
+        }
     }
 
     private func clampToScreen(_ frame: NSRect) -> NSRect {
@@ -693,7 +615,7 @@ private struct OverlayHUD: View {
                 Text("Region capture")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
-                Text("Drag edges to resize, ring to reposition on screen")
+                Text("Drag edges to resize, ring to move")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)
